@@ -136,6 +136,87 @@ BANLIST_ANCHOR = b"ark-code|astron|command-r|deepseek"
 # OS detection & path resolution
 # ---------------------------------------------------------------------------
 
+_LAST_MSIX_DIAG = []  # populated during discovery for error reporting
+
+
+def _msix_claude_asar_candidates():
+    """
+    Find resources/app.asar inside MSIX packages without being able to
+    enumerate the ACL-protected C:\\Program Files\\WindowsApps directory.
+
+    Tries, in order:
+      0. Get-AppxPackage filtered by PackageFamilyName derived from the
+         visible %LOCALAPPDATA%\\Packages\\Claude_* config directories
+      1. Get-AppxPackage -Name '*Claude*'           (fast path)
+      2. All packages, filtered by InstallLocation  (Name may lack 'Claude')
+      3. HKLM Appx registry (works without elevation)
+    Returns (candidates, diagnostics).
+    """
+    cands = []
+    diags = []
+
+    home = Path.home()
+    packages_root = Path(os.environ.get("LOCALAPPDATA", home / "AppData" / "Local")) / "Packages"
+    families = []
+    try:
+        for pkg in packages_root.glob("Claude_*"):
+            families.append(pkg.name)   # e.g. 'Claude_pzs8sxrjxfjjc'
+    except Exception:
+        pass
+
+    ps_cmds = []
+    for fam in families:
+        ps_cmds.append(["powershell", "-NoProfile", "-Command",
+                        f"(Get-AppxPackage | Where-Object {{ $_.PackageFamilyName -eq '{fam}' }})"
+                        ".InstallLocation"])
+    ps_cmds.append(["powershell", "-NoProfile", "-Command",
+                    "(Get-AppxPackage -Name '*Claude*' -ErrorAction SilentlyContinue)"
+                    ".InstallLocation"])
+    ps_cmds.append(["powershell", "-NoProfile", "-Command",
+                    "(Get-AppxPackage -ErrorAction SilentlyContinue).InstallLocation"])
+
+    for cmd in ps_cmds:
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            out = r.stdout or ""
+            diags.append(f"PS rc={r.returncode}: {out.strip()[:160]!r} "
+                         f"{(r.stderr or '').strip()[:160]!r}")
+            for ln in out.splitlines():
+                loc = ln.strip()
+                if loc and "claude" in loc.lower():
+                    root = Path(loc)
+                    # Package payload may sit at <root>\\resources or <root>\\app\\resources
+                    cands.append(root / "app" / "resources" / "app.asar")
+                    cands.append(root / "resources" / "app.asar")
+            if cands:
+                return cands, diags
+        except Exception as e:
+            diags.append(f"PS exception: {e}")
+
+    try:
+        base = r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Appx\AppxAllUserStore\Applications"
+        needle = families[0].split("_", 1)[1] if families else "Claude"
+        r = subprocess.run(["reg", "query", base, "/f", needle, "/k"],
+                           capture_output=True, text=True, timeout=60)
+        hits = [ln.strip() for ln in (r.stdout or "").splitlines()
+                if ln.strip().startswith(base)]
+        diags.append(f"reg query hits: {len(hits)}")
+        for ln in hits:
+            r2 = subprocess.run(["reg", "query", ln, "/v", "InstallLocation"],
+                                capture_output=True, text=True, timeout=30)
+            m = re.search(r"InstallLocation\s+REG_SZ\s+(.+)", r2.stdout or "")
+            if m:
+                root = Path(m.group(1).strip())
+                cands.append(root / "app" / "resources" / "app.asar")
+                cands.append(root / "resources" / "app.asar")
+        if cands:
+            return cands, diags
+    except Exception as e:
+        diags.append(f"reg exception: {e}")
+
+    return cands, diags
+
+
 def detect_os() -> str:
     system = platform.system()
     if system == "Windows":
@@ -229,6 +310,13 @@ def find_app_asar(explicit: str = None):
 
     elif os_name == "windows":
         local_appdata = Path(os.environ.get("LOCALAPPDATA", home / "AppData" / "Local"))
+
+        # MSIX / Store install: C:\Program Files\WindowsApps\Claude_<ver>_<arch>__<pub>\app\resources\
+        msix_cands, _LAST_MSIX_DIAG[:] = [], []
+        got, diag = _msix_claude_asar_candidates()
+        candidates += got
+        _LAST_MSIX_DIAG.extend(diag)
+
         # NSIS per-user installs: %LOCALAPPDATA%\AnthropicClaude\app-<ver>\resources\
         anthropic_dir = local_appdata / "AnthropicClaude"
         if anthropic_dir.exists():
@@ -257,14 +345,139 @@ def find_app_asar(explicit: str = None):
             for d in sorted(snap.glob("current/**/resources/app.asar")):
                 candidates.append(d)
 
-    for c in candidates:
-        if c.exists():
-            if "WindowsApps" in c.parts:
-                warn(f"Store/MSIX install found but not writable: {c}")
-                warn("Patch the regular EXE installer build instead.")
+    # MSIX candidates come straight from Get-AppxPackage / registry — they are
+    # authoritative. Prefer ones we can stat (elevated terminal can read
+    # WindowsApps); without elevation stat() lies, so fall back to the first.
+    msix = [c for c in candidates if is_msix_path(c)]
+    if msix:
+        for c in msix:
+            try:
+                if c.exists():
+                    return c
+            except OSError:
                 continue
-            return c
+        return msix[0]
+    for c in candidates:
+        try:
+            if c.exists():
+                return c
+        except OSError:
+            continue
     return None
+
+
+def is_msix_path(path: Path) -> bool:
+    """True when the bundle lives inside C:\\Program Files\\WindowsApps (MSIX)."""
+    return "WindowsApps" in path.parts
+
+
+def is_windows_admin() -> bool:
+    try:
+        import ctypes
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def _win_grant_write_access(path: Path) -> bool:
+    """
+    Take ownership of a TrustedInstaller-owned file and grant Administrators
+    full control so the script can write to MSIX installs. Requires elevation.
+    """
+    try:
+        subprocess.run(["takeown", "/f", str(path)], capture_output=True, timeout=60)
+        r = subprocess.run(
+            ["icacls", str(path), "/grant", "*S-1-5-32-544:F"],
+            capture_output=True, text=True, timeout=60,
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def write_file_bytes(path: Path, data: bytes) -> bool:
+    """Write bytes to path; on access-denied try an ACL takeover once (Windows)."""
+    try:
+        with open(path, "wb") as fh:
+            fh.write(data)
+        return True
+    except PermissionError:
+        if detect_os() == "windows" and _win_grant_write_access(path):
+            try:
+                with open(path, "wb") as fh:
+                    fh.write(data)
+                success(f"Granted write access via ACL takeover: {path.name}")
+                return True
+            except PermissionError:
+                pass
+        return False
+    except OSError:
+        return False
+
+
+def copy_file_bytes(src: Path, dst: Path) -> bool:
+    """copy2 that survives TrustedInstaller-owned destinations (Windows)."""
+    try:
+        shutil.copy2(src, dst)
+        return True
+    except PermissionError:
+        if detect_os() == "windows":
+            _win_grant_write_access(dst)
+            try:
+                shutil.copy2(src, dst)
+                return True
+            except PermissionError:
+                pass
+        return False
+
+
+# Electron v1 fuse wire: sentinel + [version][count][states...].
+# State encoding: '0'=disabled, '1'=enabled, ' '=removed.
+# Slot order (FuseV1Options): RunAsNode, CookieEncryptionKey, NodeOptions,
+# NodeCliInspect, EmbeddedAsarIntegrityValidation, OnlyLoadAppFromAsar, ...
+# (slot 4 verified against the macOS build where integrity is enforced)
+FUSE_SENTINEL = b"dL7pKGdnNz796PbbjQWNKmHXBZaB9tsX"
+ASAR_INTEGRITY_FUSE_INDEX = 4
+
+
+def disable_asar_integrity_fuse(search_dir: Path) -> int:
+    """
+    Flip the EnableEmbeddedAsarIntegrityValidation fuse from enabled to
+    disabled inside every PE binary that carries a fuse wire.
+
+    Needed on Windows Store builds: expected header hashes are baked into the
+    executable, which we cannot rewrite — disabling the check is simpler and
+    the signature is already broken by patching anyway.
+
+    Returns number of binaries modified.
+    """
+    flipped = 0
+    root_str = str(search_dir)
+    try:
+        entries = list(search_dir.rglob("*"))
+    except Exception:
+        entries = list(search_dir.iterdir())
+    for f in entries:
+        try:
+            if not f.is_file() or f.suffix.lower() not in (".exe", ".dll"):
+                continue
+            if f.stat().st_size > 800 * 1024 * 1024:
+                continue
+            data = f.read_bytes()
+            i = data.find(FUSE_SENTINEL)
+            if i < 0:
+                continue
+            off = i + len(FUSE_SENTINEL) + 2 + ASAR_INTEGRITY_FUSE_INDEX
+            if off >= len(data) or chr(data[off]) not in ("1", "2"):
+                continue
+            new = bytearray(data)
+            new[off] = ord("0")
+            if write_file_bytes(f, bytes(new)):
+                flipped += 1
+                info(f"Disabled ASAR-integrity fuse in: {f.relative_to(root_str)}")
+        except Exception:
+            continue
+    return flipped
 
 
 # ---------------------------------------------------------------------------
@@ -582,10 +795,8 @@ def patch_ion_dist(ion_dir: Path, backup_dir: Path):
         bak = backup_dir / "ion-dist" / rel
         if not bak.exists():
             bak.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(f, bak)
-        try:
-            f.write_bytes(new)
-        except PermissionError:
+            copy_file_bytes(f, bak)
+        if not write_file_bytes(f, new):
             warn(f"No write access to {f} — skipped.")
             continue
         patched.append(str(rel))
@@ -604,7 +815,7 @@ def restore_ion_dist(ion_dir: Path, backup_dir: Path) -> int:
         rel = f.relative_to(src_root)
         target = ion_dir / rel
         if target.exists():
-            shutil.copy2(f, target)
+            copy_file_bytes(f, target)
             restored += 1
     return restored
 
@@ -628,6 +839,14 @@ def seed_vm_probe_cache(app_version: str):
     elif detect_os() == "windows":
         appdata = Path(os.environ.get("APPDATA", home / "AppData" / "Roaming"))
         candidates = [appdata / "Claude", appdata / "Claude-3p"]
+        # MSIX virtualized profile: %LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\
+        packages_root = Path(os.environ.get("LOCALAPPDATA", home / "AppData" / "Local")) / "Packages"
+        try:
+            for pkg in packages_root.glob("Claude_*"):
+                candidates.append(pkg / "LocalCache" / "Roaming" / "Claude")
+                candidates.append(pkg / "LocalCache" / "Roaming" / "Claude-3p")
+        except Exception:
+            pass
     elif detect_os() == "linux":
         cfg = home / ".config"
         candidates = [cfg / "Claude", cfg / "Claude-3p"]
@@ -773,6 +992,14 @@ def show_status(asar_path: Path, backup_dir: Path) -> int:
     elif detect_os() == "windows":
         a = Path(os.environ.get("APPDATA", home / "AppData" / "Roaming"))
         dirs = [a / "Claude", a / "Claude-3p"]
+        packages_root = Path(os.environ.get("LOCALAPPDATA", home / "AppData" / "Local")) / "Packages"
+        try:
+            for pkg in sorted(packages_root.glob("Claude_*")):
+                lc = pkg / "LocalCache" / "Roaming"
+                dirs.append(lc / "Claude")
+                dirs.append(lc / "Claude-3p")
+        except Exception:
+            pass
     elif detect_os() == "linux":
         c = home / ".config"
         dirs = [c / "Claude", c / "Claude-3p"]
@@ -794,6 +1021,32 @@ def show_status(asar_path: Path, backup_dir: Path) -> int:
     print(f"{Colors.BOLD}Backup{Colors.RESET}")
     print(f"  {bak}: {'present (' + str(bak.stat().st_size) + ' bytes)' if bak.exists() else 'none'}")
 
+    # 5. Windows Host Compute Services (workspace VM prerequisite)
+    if detect_os() == "windows":
+        print(f"{Colors.BOLD}Host Compute Services (workspace VM){Colors.RESET}")
+        missing = []
+        for svc in ("vmcompute", "hns", "vfpext"):
+            try:
+                out = subprocess.run(
+                    ["sc", "query", svc], capture_output=True, text=True
+                )
+                txt = (out.stdout or "") + (out.stderr or "")
+                if "FAILED 1060" in txt or out.returncode == 1060 or ": 1060" in txt:
+                    missing.append(svc)
+                elif "RUNNING" in txt:
+                    continue
+                else:
+                    missing.append(f"{svc} (installed, not running)")
+            except Exception:
+                missing.append(svc)
+        if missing:
+            warn("missing: " + ", ".join(missing))
+            print("  Enable via admin PowerShell:")
+            print("    dism /online /enable-feature /featurename:VirtualMachinePlatform /all")
+            print("  …then reboot and start the services (they start on demand).")
+        else:
+            success("all required services running")
+
     print()
     print(f"Run with {Colors.BOLD}--patch-model-names{Colors.RESET} to apply missing patches.")
     return 0
@@ -810,7 +1063,16 @@ def patch_app_model_names(asar_path: Path, backup_dir: Path, resign: bool = True
 
     backup_dir.mkdir(parents=True, exist_ok=True)
     backup_path = backup_dir / "app.asar.bak"
-    data = bytearray(asar_path.read_bytes())
+    try:
+        data = bytearray(asar_path.read_bytes())
+    except FileNotFoundError:
+        error(f"app.asar not found at: {asar_path}")
+        error("The package layout differs from the expected one — pass the exact path:")
+        error('  --asar-path "C:\\Program Files\\WindowsApps\\Claude_<ver>_x64__<pub>\\app\\resources\\app.asar"')
+        return False
+    except PermissionError:
+        error(f"No read access to {asar_path} — run this terminal as Administrator.")
+        return False
 
     parsed = _asar_parse_header(bytes(data))
     if not parsed:
@@ -911,7 +1173,7 @@ def patch_app_model_names(asar_path: Path, backup_dir: Path, resign: bool = True
     data[json_start:json_end] = new_header_bytes
 
     if not backup_path.exists():
-        shutil.copy2(asar_path, backup_path)
+        copy_file_bytes(asar_path, backup_path)
         info(f"Backup created: {backup_path}")
     else:
         info(f"Backup already exists, keeping pristine copy: {backup_path}")
@@ -920,10 +1182,7 @@ def patch_app_model_names(asar_path: Path, backup_dir: Path, resign: bool = True
         error("Internal error: archive length changed, aborting without write.")
         return False
 
-    try:
-        with open(asar_path, "r+b") as fh:
-            fh.write(bytes(data))
-    except PermissionError:
+    if not write_file_bytes(asar_path, bytes(data)):
         error(f"No write access to {asar_path}. Close Claude / check permissions")
         if detect_os() == "windows":
             error("Try running the terminal as Administrator.")
@@ -936,6 +1195,14 @@ def patch_app_model_names(asar_path: Path, backup_dir: Path, resign: bool = True
     for p in files_patched:
         print(f"      {p}")
     success("ASAR header integrity hashes updated.")
+
+    # Windows: expected header hashes are baked into the executables — disable
+    # the integrity fuse instead of trying to rewrite PE resources.
+    if detect_os() == "windows":
+        app_root = asar_path.parent.parent
+        n = disable_asar_integrity_fuse(app_root)
+        if n:
+            success(f"Disabled ASAR-integrity fuse in {n} executable(s).")
 
     ion_dir = find_ion_dist_dir(asar_path)
     if ion_dir:
@@ -1094,9 +1361,7 @@ def unpatch_app_model_names(asar_path: Path, backup_dir: Path, resign: bool = Tr
 
     backup_path = backup_dir / "app.asar.bak"
     if backup_path.exists():
-        try:
-            shutil.copy2(backup_path, asar_path)
-        except PermissionError:
+        if not copy_file_bytes(backup_path, asar_path):
             error(f"No write access to {asar_path}. Close Claude / elevate permissions.")
             return False
         success(f"Restored original bundle: {asar_path}")
@@ -1323,6 +1588,7 @@ def main() -> int:
 
     os_name = detect_os()
     info(f"Detected OS: {platform.system()}")
+    info("Script build: 2026-08-23-msix3 (auto-detect MSIX, no exists() gate)")
 
     try:
         claude_3p_dir = get_claude_3p_dir()
@@ -1342,6 +1608,18 @@ def main() -> int:
     if args.status:
         return show_status(asar_path, backup_dir)
 
+    # Store (MSIX) installs live under TrustedInstaller-owned WindowsApps:
+    # patching requires elevation (takeown/icacls on each touched file).
+    if os_name == "windows" and asar_path and is_msix_path(asar_path) \
+            and (args.patch_model_names or args.unpatch_app):
+        info("Detected Store (MSIX) install inside WindowsApps.")
+        if not is_windows_admin():
+            error("Patching it requires administrator rights.")
+            error("Right-click your terminal → 'Run as administrator', then re-run this command.")
+            return 1
+        warn("MSIX note: Windows may auto-repair the package after modification.")
+        warn("If Claude stops launching, reinstall from claude.ai/download (EXE build) and re-patch.")
+
     if args.unpatch_app:
         if not asar_path:
             error("app.asar not found. Pass --asar-path explicitly.")
@@ -1353,7 +1631,10 @@ def main() -> int:
     if standalone_patch:
         if not asar_path:
             error("Claude Desktop app.asar not found automatically.")
-            error("Pass it explicitly: --asar-path '/path/to/Claude.app/Contents/Resources/app.asar'")
+            for d in _LAST_MSIX_DIAG:
+                info(f"discovery: {d}")
+            error("Pass it explicitly, e.g.:")
+            error('  --asar-path "C:\\Program Files\\WindowsApps\\Claude_<ver>_x64__<pub>\\app\\resources\\app.asar"')
             return 1
         info(f"App bundle: {asar_path}")
         patch_app_model_names(asar_path, backup_dir, resign=not args.no_resign)
@@ -1486,7 +1767,13 @@ def main() -> int:
         target_asar = asar_path or find_app_asar(args.asar_path)
         if not target_asar:
             warn("app.asar not found — skipping the model-name patch.")
-            warn("Pass it explicitly: --asar-path '/path/to/Claude.app/Contents/Resources/app.asar'")
+            for d in _LAST_MSIX_DIAG:
+                info(f"discovery: {d}")
+        elif detect_os() == "windows" and is_msix_path(target_asar) and not is_windows_admin():
+            error("Store (MSIX) install detected — run this terminal as Administrator to patch it.")
+            error("Skipping the model-name patch for now.")
+            warn("Pass it explicitly, e.g.:")
+            warn('  --asar-path "C:\\Program Files\\WindowsApps\\Claude_<ver>_x64__<pub>\\app\\resources\\app.asar"')
         else:
             info(f"Patching app bundle: {target_asar}")
             patch_app_model_names(target_asar, backup_dir, resign=not args.no_resign)
