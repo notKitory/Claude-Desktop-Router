@@ -44,6 +44,9 @@ Optional app-bundle patch:
         (Electron verifies them on load),
       - updates the header hash recorded in Info.plist
         (ElectronAsarIntegrity) on macOS,
+      - patches the settings-UI renderer copy of the validator (ion-dist,
+        lives outside app.asar) — otherwise adding custom models in Settings
+        still fails with "Doesn't look like an Anthropic model",
       - neutralizes the Cowork VM start gate and seeds the
         vm-support-probe.json caches with virtSupport=supported,
       - re-signs the bundle ad-hoc WITH entitlements (virtualization, JIT,
@@ -385,6 +388,86 @@ def patch_banword_validators(data: bytes):
     return out, len(edits), already
 
 
+def patch_banword_validators_negated(data: bytes):
+    """
+    Same as patch_banword_validators but for the inverted validator shape used
+    by the settings-UI renderer bundle:
+
+      `function X(e){const t=e.toLowerCase();return!BAN.test(t)&&(A.test(t)||W.some(...))}`
+
+    The negation makes the ternary-based classifier above miss it.
+    Returns (new_data, patched_count, already_patched_count).
+    """
+    edits = []
+    already = 0
+
+    pos = 0
+    while True:
+        anchor = data.find(BANLIST_ANCHOR, pos)
+        if anchor < 0:
+            break
+        pos = anchor + 1
+
+        r_start = anchor - 1 if data[anchor - 1:anchor] == b"/" else data.rfind(b"/", 0, anchor)
+        if r_start < 0:
+            continue
+        eq = r_start - 1
+        if data[eq:eq + 1] != b"=":
+            continue
+        banvar = _prev_ident(data, eq)
+        if not banvar:
+            continue
+        r_end = data.find(b"/", anchor)
+        if r_end < 0:
+            continue
+        f = r_end + 1
+        while chr(data[f]).isalpha() and data[f:f + 1] != b"_":
+            f += 1
+
+        window = data[f:min(f + 1200, len(data))]
+        for m in _FUNC_RE.finditer(window):
+            open_idx = f + m.end() - 1
+            close_idx = _match_brace(data, open_idx)
+            if close_idx < 0:
+                continue
+            span_start = f + m.start()
+            body = data[open_idx + 1:close_idx]
+
+            neg_validator = re.search(
+                rb"!\s*" + re.escape(banvar) + rb"\.test", body
+            )
+            pure_probe = re.fullmatch(
+                rb"\s*return\s+" + re.escape(banvar) + rb"\.test\(.+\)\s*;?\s*", body
+            )
+
+            if neg_validator:
+                new_body = b"return!0"
+            elif pure_probe:
+                new_body = b"return!1"
+            elif body.strip() in (b"return!0", b"return!1"):
+                already += 1
+                continue
+            else:
+                continue
+
+            prefix = data[span_start:open_idx + 1]
+            replacement = prefix + new_body + b"}"
+            pad = (close_idx + 1) - span_start - len(replacement)
+            if pad < 0:
+                continue
+            replacement += b" " * pad
+            edits.append((span_start, close_idx + 1, replacement))
+
+    if not edits:
+        return data, 0, already
+
+    out = data
+    for start, end, repl in sorted(edits, key=lambda e: e[0], reverse=True):
+        assert len(repl) == end - start
+        out = out[:start] + repl + out[end:]
+    return out, len(edits), already
+
+
 def _asar_parse_header(data: bytes):
     """
     Parse the asar pickle header. Returns
@@ -463,6 +546,67 @@ def patch_vm_start_gate(data: bytes):
 def _asar_read_file(data: bytes, base: int, entry: dict) -> bytes:
     off = base + int(entry["offset"])
     return bytes(data[off:off + int(entry["size"])])
+
+
+def find_ion_dist_dir(asar_path: Path):
+    """Locate the renderer web bundle (ion-dist) shipped next to app.asar."""
+    if detect_os() == "macos":
+        app = _find_app_bundle(asar_path)
+        if not app:
+            return None
+        d = app / "Contents" / "Resources" / "ion-dist"
+    else:
+        d = asar_path.parent / "ion-dist"
+    return d if d and d.exists() else None
+
+
+def patch_ion_dist(ion_dir: Path, backup_dir: Path):
+    """
+    Patch the renderer (settings UI) copies of the banword validators that
+    live outside app.asar. Originals are backed up for --unpatch-app.
+    Returns number of files patched.
+    """
+    patched = []
+    for f in sorted(ion_dir.rglob("*.js")):
+        try:
+            raw = f.read_bytes()
+        except Exception:
+            continue
+        if BANLIST_ANCHOR not in raw:
+            continue
+        new, n1, _ = patch_banword_validators(raw)
+        new, n2, al = patch_banword_validators_negated(new)
+        if n1 == 0 and n2 == 0:
+            continue
+        rel = f.relative_to(ion_dir)
+        bak = backup_dir / "ion-dist" / rel
+        if not bak.exists():
+            bak.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(f, bak)
+        try:
+            f.write_bytes(new)
+        except PermissionError:
+            warn(f"No write access to {f} — skipped.")
+            continue
+        patched.append(str(rel))
+    return patched
+
+
+def restore_ion_dist(ion_dir: Path, backup_dir: Path) -> int:
+    """Restore renderer files previously backed up by patch_ion_dist."""
+    src_root = backup_dir / "ion-dist"
+    if not src_root.exists():
+        return 0
+    restored = 0
+    for f in sorted(src_root.rglob("*")):
+        if not f.is_file():
+            continue
+        rel = f.relative_to(src_root)
+        target = ion_dir / rel
+        if target.exists():
+            shutil.copy2(f, target)
+            restored += 1
+    return restored
 
 
 def seed_vm_probe_cache(app_version: str):
@@ -551,6 +695,26 @@ def show_status(asar_path: Path, backup_dir: Path) -> int:
         state = f"NOT patched ({ban_total} validator(s) active)"
     print(f"  banword check: {state}")
     print(f"  VM start gate: {'patched ✓' if gate_left == 0 else f'NOT patched ({gate_left} active)'}")
+
+    ion_dir = find_ion_dist_dir(asar_path)
+    if ion_dir:
+        ion_pending = 0
+        ion_found = False
+        for f in ion_dir.rglob("*.js"):
+            try:
+                raw = f.read_bytes()
+            except Exception:
+                continue
+            if BANLIST_ANCHOR not in raw:
+                continue
+            ion_found = True
+            _, n1, _ = patch_banword_validators(raw)
+            _, n2, _ = patch_banword_validators_negated(raw)
+            ion_pending += n1 + n2
+        if ion_found:
+            print(f"  settings UI:   {'patched ✓' if ion_pending == 0 else f'NOT patched ({ion_pending} active)'}")
+    else:
+        print("  settings UI:   ion-dist bundle not found")
 
     # 2. Header hash vs Info.plist (macOS)
     print(f"{Colors.BOLD}Integrity{Colors.RESET}")
@@ -699,11 +863,22 @@ def patch_app_model_names(asar_path: Path, backup_dir: Path, resign: bool = True
         if total_already:
             success(f"Already patched ({total_already} validator(s), {vm_gates_patched} VM gate(s)).")
             # Still bring the bundle to a fully working state: plist hash sync,
-            # probe cache seed and an entitlement-bearing re-sign.
+            # probe cache seed, renderer patch and an entitlement-bearing re-sign.
             header_sha_now = hashlib.sha256(bytes(data[json_start:json_end])).hexdigest()
             _update_macos_header_hash(asar_path, header_sha_now)
             if app_version:
                 seed_vm_probe_cache(app_version)
+            ion_dir = find_ion_dist_dir(asar_path)
+            if ion_dir:
+                ion_patched = patch_ion_dist(ion_dir, backup_dir)
+                if ion_patched:
+                    success(f"Patched settings-UI renderer validators in {len(ion_patched)} file(s):")
+                    for p in ion_patched:
+                        print(f"      ion-dist/{p}")
+                else:
+                    info("Settings-UI renderer already patched or contains no banword list.")
+            else:
+                warn("ion-dist renderer bundle not found — settings UI may still enforce banwords.")
             if resign:
                 resign_macos_app(asar_path)
             return True
@@ -761,6 +936,18 @@ def patch_app_model_names(asar_path: Path, backup_dir: Path, resign: bool = True
     for p in files_patched:
         print(f"      {p}")
     success("ASAR header integrity hashes updated.")
+
+    ion_dir = find_ion_dist_dir(asar_path)
+    if ion_dir:
+        ion_patched = patch_ion_dist(ion_dir, backup_dir)
+        if ion_patched:
+            success(f"Patched settings-UI renderer validators in {len(ion_patched)} file(s):")
+            for p in ion_patched:
+                print(f"      ion-dist/{p}")
+        else:
+            info("Settings-UI renderer already patched or contains no banword list.")
+    else:
+        warn("ion-dist renderer bundle not found — settings UI may still enforce banwords.")
 
     if app_version:
         seed_vm_probe_cache(app_version)
@@ -902,17 +1089,31 @@ def claude_running() -> bool:
 
 
 def unpatch_app_model_names(asar_path: Path, backup_dir: Path, resign: bool = True) -> bool:
-    """Restore app.asar from the pristine backup."""
+    """Restore app.asar and renderer files from the pristine backups."""
+    restored_any = False
+
     backup_path = backup_dir / "app.asar.bak"
-    if not backup_path.exists():
-        warn(f"No app.asar backup found at: {backup_path} — nothing to restore.")
+    if backup_path.exists():
+        try:
+            shutil.copy2(backup_path, asar_path)
+        except PermissionError:
+            error(f"No write access to {asar_path}. Close Claude / elevate permissions.")
+            return False
+        success(f"Restored original bundle: {asar_path}")
+        restored_any = True
+    else:
+        warn(f"No app.asar backup found at: {backup_path}.")
+        info("The renderer patch can still be reverted if its backups exist.")
+
+    ion_dir = find_ion_dist_dir(asar_path)
+    if ion_dir:
+        n = restore_ion_dist(ion_dir, backup_dir)
+        if n:
+            success(f"Restored {n} renderer file(s) from backup.")
+            restored_any = True
+
+    if not restored_any:
         return False
-    try:
-        shutil.copy2(backup_path, asar_path)
-    except PermissionError:
-        error(f"No write access to {asar_path}. Close Claude / elevate permissions.")
-        return False
-    success(f"Restored original bundle: {asar_path}")
     if resign:
         resign_macos_app(asar_path)
     print("Restart Claude Desktop to apply.")
