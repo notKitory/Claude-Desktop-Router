@@ -74,6 +74,16 @@ python setup-claude-gateway.py \
 
 After restart, your gateway's model should appear in the Claude Desktop model picker with the Anthropic model ID you specified.
 
+### Updating Claude Desktop & Re-patching
+
+Because patched apps cannot use Electron's built-in Squirrel auto-updater (due to signature mismatch), you can update Claude Desktop directly using:
+
+```bash
+python setup-claude-gateway.py --update
+```
+
+This checks Anthropic's official update feed for the latest version, downloads and installs it, and automatically re-applies all model name & VM gate patches in one step. Use `--force` to reinstall/re-patch even if already at the latest version.
+
 ### App Bundle Only
 
 Patch without touching the gateway config (e.g., after a Claude Desktop auto-update):

@@ -55,9 +55,13 @@ Optional app-bundle patch:
         ...) + hardened runtime — otherwise macOS refuses to launch the app
         and Virtualization.framework refuses to create the workspace VM.
 
+    `--update` downloads the latest official Claude Desktop version, installs it,
+    and automatically re-applies all patches (model names, 1M context, VM gates).
+
     `--unpatch-app` restores the original app.asar from the backup.
     `--status` shows what is currently applied.
 
+    python setup-claude-gateway.py --update                     # update app & patch
     python setup-claude-gateway.py --patch-model-names          # patch app only
     python setup-claude-gateway.py --unpatch-app                # revert app patch
     python setup-claude-gateway.py --status                     # diagnostics
@@ -76,9 +80,14 @@ import os
 import platform
 import re
 import shutil
+import stat
 import struct
 import subprocess
 import sys
+import tempfile
+import time
+import urllib.request
+import zipfile
 from pathlib import Path
 
 # Force UTF-8 on Windows to avoid UnicodeEncodeError
@@ -1460,6 +1469,344 @@ def unpatch_app_model_names(asar_path: Path, backup_dir: Path, resign: bool = Tr
 
 
 # ---------------------------------------------------------------------------
+# App updater logic
+# ---------------------------------------------------------------------------
+
+def _parse_semver(v: str) -> tuple:
+    """Parse version string into tuple of ints for reliable comparison."""
+    if not v:
+        return (0,)
+    m = re.search(r"(\d+(?:\.\d+)+)", str(v))
+    if not m:
+        return (0,)
+    return tuple(int(x) for x in m.group(1).split("."))
+
+
+def _get_latest_release_info(os_name: str) -> tuple:
+    """
+    Check the official Anthropic update feed for the latest release.
+    Returns (version_str, download_url, checksum_or_hash).
+    """
+    machine = platform.machine().lower()
+    headers = {"User-Agent": "ClaudeDesktop/1.0.0"}
+
+    if os_name == "macos":
+        arch = "arm64" if machine in ("arm64", "aarch64") else "universal"
+        url = f"https://api.anthropic.com/api/desktop/darwin/{arch}/squirrel/update?device_id=00000000-0000-0000-0000-000000000000"
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                latest_ver = data.get("currentRelease")
+                releases = data.get("releases", [])
+                if releases:
+                    upd = releases[0].get("updateTo", {})
+                    return latest_ver or upd.get("version"), upd.get("url"), upd.get("sha256")
+                return latest_ver, None, None
+        except Exception as e:
+            warn(f"Failed to check macOS update feed: {e}")
+            return None, None, None
+
+    elif os_name == "windows":
+        arch = "arm64" if machine in ("arm64", "aarch64") else "x64"
+        url = f"https://api.anthropic.com/api/desktop/win32/{arch}/squirrel/update?device_id=00000000-0000-0000-0000-000000000000"
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                text = resp.read().decode("utf-8", errors="ignore")
+                for line in reversed(text.splitlines()):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        file_url = parts[1]
+                        m = re.search(r"Claude[^\d]*(\d+(?:\.\d+)+)", file_url, re.IGNORECASE)
+                        ver = m.group(1) if m else None
+                        return ver, file_url, parts[0]
+                return None, None, None
+        except Exception as e:
+            warn(f"Failed to check Windows update feed: {e}")
+            return None, None, None
+
+    elif os_name == "linux":
+        warn("Official Linux releases are not distributed via the Anthropic update feed.")
+        info("If using an unofficial Linux package, please update via your package manager.")
+        return None, None, None
+
+    return None, None, None
+
+
+def _download_file_with_progress(url: str, dest_path: Path) -> bool:
+    """Download a remote URL to dest_path with progress indication."""
+    info(f"Downloading: {url}")
+    headers = {"User-Agent": "ClaudeDesktop/1.0.0"}
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            total_size = resp.getheader("Content-Length")
+            total_bytes = int(total_size) if total_size and total_size.isdigit() else 0
+            downloaded = 0
+            chunk_size = 1024 * 1024  # 1MB chunks
+
+            with open(dest_path, "wb") as f:
+                while True:
+                    chunk = resp.read(chunk_size)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if total_bytes > 0:
+                        pct = (downloaded / total_bytes) * 100
+                        mb_done = downloaded / (1024 * 1024)
+                        mb_total = total_bytes / (1024 * 1024)
+                        sys.stdout.write(f"\r  Progress: {pct:5.1f}% ({mb_done:6.1f}MB / {mb_total:6.1f}MB)")
+                        sys.stdout.flush()
+                    else:
+                        mb_done = downloaded / (1024 * 1024)
+                        sys.stdout.write(f"\r  Downloaded: {mb_done:6.1f}MB")
+                        sys.stdout.flush()
+            print()
+            return True
+    except Exception as e:
+        print()
+        error(f"Download failed: {e}")
+        return False
+
+
+def _close_claude_process() -> None:
+    """Attempt to gracefully terminate or kill running Claude Desktop processes."""
+    if not claude_running():
+        return
+    info("Closing running Claude Desktop process...")
+    os_name = detect_os()
+    try:
+        if os_name == "windows":
+            subprocess.run(["taskkill", "/F", "/IM", "Claude.exe"], capture_output=True)
+        elif os_name == "macos":
+            subprocess.run(["pkill", "-f", "Claude"], capture_output=True)
+        elif os_name == "linux":
+            subprocess.run(["pkill", "-f", "claude"], capture_output=True)
+    except Exception:
+        pass
+    time.sleep(1)
+
+
+def _extract_zip(zip_path: Path, extract_to: Path) -> bool:
+    """
+    Extract a ZIP archive. On macOS/Unix, uses 'ditto' or preserves symlinks and permissions
+    so frameworks (Electron, Mantle, etc.) retain their symlinks and executable bits.
+    """
+    extract_to.mkdir(parents=True, exist_ok=True)
+
+    # Fast path on macOS: ditto preserves resource forks, extended attributes, and symlinks
+    if detect_os() == "macos" and shutil.which("ditto"):
+        try:
+            r = subprocess.run(["ditto", "-x", "-k", str(zip_path), str(extract_to)], capture_output=True, text=True)
+            if r.returncode == 0:
+                return True
+        except Exception:
+            pass
+
+    try:
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            for member in zf.infolist():
+                mode = member.external_attr >> 16
+                dest = extract_to / member.filename
+                if stat.S_ISLNK(mode):
+                    link_target = zf.read(member).decode("utf-8")
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    if dest.is_symlink() or dest.exists():
+                        dest.unlink()
+                    os.symlink(link_target, dest)
+                else:
+                    zf.extract(member, extract_to)
+                    if mode:
+                        try:
+                            os.chmod(dest, mode)
+                        except Exception:
+                            pass
+        return True
+    except Exception as e:
+        error(f"Failed to extract zip archive: {e}")
+        return False
+
+
+def _clear_quarantine_macos(target_path: Path) -> None:
+    """Remove com.apple.quarantine attribute on macOS to prevent Gatekeeper blockage."""
+    if detect_os() != "macos":
+        return
+    try:
+        subprocess.run(["xattr", "-cr", str(target_path)], capture_output=True)
+    except Exception:
+        pass
+
+
+def update_claude_desktop(
+    explicit_asar_path: str = None,
+    backup_dir: Path = None,
+    force: bool = False,
+    no_resign: bool = False,
+) -> bool:
+    """
+    Check for the latest Claude Desktop version, download, install, and apply patches.
+    """
+    os_name = detect_os()
+    info("Checking for Claude Desktop updates...")
+
+    latest_ver, download_url, chk = _get_latest_release_info(os_name)
+    if not latest_ver:
+        error("Could not determine the latest version from update feed.")
+        return False
+
+    info(f"Latest version available: {latest_ver}")
+
+    # Determine installed version
+    asar_path = find_app_asar(explicit_asar_path)
+    installed_ver = None
+    if asar_path and asar_path.exists():
+        try:
+            data = asar_path.read_bytes()
+            parsed = _asar_parse_header(data)
+            if parsed:
+                hdr, _, _, base = parsed
+                installed_ver = _asar_app_version(hdr, data, base)
+        except Exception:
+            pass
+
+    if installed_ver:
+        info(f"Currently installed version: {installed_ver}")
+        if not force and _parse_semver(installed_ver) >= _parse_semver(latest_ver):
+            success(f"Claude Desktop is already up to date ({installed_ver}).")
+            info("Use --force to reinstall and re-patch anyway.")
+            return True
+    else:
+        info("Installed version: not detected / fresh install")
+
+    if not download_url:
+        error("No download URL found for this platform.")
+        return False
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+
+        if os_name == "macos":
+            zip_dest = tmp_path / "Claude-update.zip"
+            if not _download_file_with_progress(download_url, zip_dest):
+                return False
+
+            info("Extracting update package...")
+            extract_dir = tmp_path / "extracted"
+            extract_dir.mkdir(parents=True, exist_ok=True)
+
+            if not _extract_zip(zip_dest, extract_dir):
+                return False
+
+            downloaded_app = extract_dir / "Claude.app"
+            if not downloaded_app.exists():
+                candidates = list(extract_dir.glob("**/Claude.app"))
+                if candidates:
+                    downloaded_app = candidates[0]
+                else:
+                    error("Claude.app not found in downloaded update.")
+                    return False
+
+            _close_claude_process()
+
+            # Target installation path
+            target_app = Path("/Applications/Claude.app")
+            home_app = Path.home() / "Applications" / "Claude.app"
+            if asar_path and "Claude.app" in str(asar_path):
+                cur_bundle = _find_app_bundle(asar_path)
+                if cur_bundle:
+                    target_app = cur_bundle
+            elif not target_app.exists() and home_app.exists():
+                target_app = home_app
+
+            info(f"Installing update to: {target_app}")
+            try:
+                if target_app.exists():
+                    shutil.rmtree(target_app)
+                # Use ditto on macOS if available to preserve symlinks and permissions exactly
+                if shutil.which("ditto"):
+                    subprocess.run(["ditto", str(downloaded_app), str(target_app)], check=True)
+                else:
+                    shutil.copytree(downloaded_app, target_app, symlinks=True)
+                success("New version installed successfully.")
+            except PermissionError:
+                error(f"Permission denied writing to {target_app}.")
+                error("Try running the script with sudo / administrator permissions.")
+                return False
+            except Exception as e:
+                error(f"Failed to replace Claude.app: {e}")
+                return False
+
+            # Clear quarantine attribute so Gatekeeper allows running
+            _clear_quarantine_macos(target_app)
+
+            # Locate newly installed asar and patch
+            new_asar = target_app / "Contents" / "Resources" / "app.asar"
+            if not new_asar.exists():
+                error(f"Updated app.asar not found at {new_asar}")
+                return False
+
+            info("Applying model name & capability patches to the updated app...")
+            if backup_dir is None:
+                backup_dir = get_backup_dir()
+            ok = patch_app_model_names(new_asar, backup_dir, resign=not no_resign)
+            if ok:
+                success(f"Successfully updated Claude Desktop to {latest_ver} and applied patches!")
+                return True
+            else:
+                warn("Updated application installed, but patching failed.")
+                return False
+
+        elif os_name == "windows":
+            # For Windows, download the installer and run it
+            is_nupkg = download_url.endswith(".nupkg")
+            if is_nupkg:
+                installer_url = "https://downloads.claude.ai/releases/win32/x64/ClaudeSetup.exe"
+            else:
+                installer_url = download_url
+
+            exe_dest = tmp_path / "ClaudeSetup.exe"
+            if not _download_file_with_progress(installer_url, exe_dest):
+                return False
+
+            _close_claude_process()
+
+            info("Running installer...")
+            try:
+                subprocess.run([str(exe_dest)], check=True)
+                success("Installer executed. Waiting for installation to complete...")
+                time.sleep(3)
+                _close_claude_process()
+            except Exception as e:
+                error(f"Failed to execute installer: {e}")
+                return False
+
+            new_asar = find_app_asar(explicit_asar_path)
+            if not new_asar or not new_asar.exists():
+                error("Could not find app.asar after installation.")
+                return False
+
+            info("Applying model name & capability patches to updated installation...")
+            if backup_dir is None:
+                backup_dir = get_backup_dir()
+            ok = patch_app_model_names(new_asar, backup_dir, resign=False)
+            if ok:
+                success(f"Successfully updated Claude Desktop to {latest_ver} and applied patches!")
+                return True
+            return False
+
+        elif os_name == "linux":
+            error("Automatic update is not supported for Linux builds.")
+            return False
+
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Config I/O
 # ---------------------------------------------------------------------------
 
@@ -1643,6 +1990,10 @@ Examples:
     parser.add_argument("--model-id", default="claude-sonnet-4-5", help="Anthropic model ID to present (default: claude-sonnet-4-5)")
     parser.add_argument("--auth-scheme", default="bearer", help="Auth scheme: bearer, basic, ... (default: bearer)")
     parser.add_argument("--restore", action="store_true", help="Restore original stock Anthropic config")
+    parser.add_argument("--update", action="store_true",
+                        help="Download and install the latest official Claude Desktop version and apply patches")
+    parser.add_argument("--force", action="store_true",
+                        help="Force update even if the installed version appears to be current")
     parser.add_argument("--patch-model-names", action="store_true",
                         help="Patch app.asar so non-Anthropic model names (gpt, gemini, glm, ...) are accepted")
     parser.add_argument("--unpatch-app", action="store_true",
@@ -1672,6 +2023,18 @@ def main() -> int:
 
     info(f"Claude-3p directory: {claude_3p_dir}")
     backup_dir = get_backup_dir(args.backup_dir)
+
+    # ------------------------------------------------------------------
+    # APP UPDATE MODE (--update)
+    # ------------------------------------------------------------------
+    if args.update:
+        ok = update_claude_desktop(
+            explicit_asar_path=args.asar_path,
+            backup_dir=backup_dir,
+            force=args.force,
+            no_resign=args.no_resign,
+        )
+        return 0 if ok else 1
 
     # ------------------------------------------------------------------
     # APP BUNDLE PATCH MODE (--unpatch-app / --patch-model-names / --status)
