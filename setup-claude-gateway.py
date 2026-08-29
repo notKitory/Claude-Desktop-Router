@@ -40,6 +40,8 @@ Optional app-bundle patch:
     `--patch-model-names` rewrites the validator inside app.asar so any model
     name is accepted. It also:
 
+      - enables 1M-context [1m] variants for all discovered gateway models
+        in the model picker,
       - recomputes per-file SHA256 integrity entries in the asar header
         (Electron verifies them on load),
       - updates the header hash recorded in Info.plist
@@ -719,6 +721,57 @@ def _asar_integrity(content: bytes, block_size: int):
 
 _VM_GATE_ANCHOR = b"?.isVirtualizationSupported?.();if("
 
+_DISCOVERY_1M_ANCHOR = b"max_input_tokens)&&{supports1m:!0}"
+_DISCOVERY_1M_RE = re.compile(
+    rb"([a-zA-Z0-9_$]+)=\(([a-zA-Z0-9_$]+),([a-zA-Z0-9_$]+)\)=>"
+    rb"typeof\s+\2==[`\"\x27]boolean[`\"\x27]\?\2:"
+    rb"typeof\s+\3==[`\"\x27]number[`\"\x27]&&\3>=1e6"
+)
+
+
+def patch_discovery_1m_models(data: bytes):
+    """
+    Rewrite the model discovery 1M-context capability probe:
+      `l=(e,t)=>typeof e==`boolean`?e:typeof t==`number`&&t>=1e6` -> `l=(e,t)=>!0`
+    so that all discovered gateway models are granted supports1m=true, adding their
+    [1m] extended context variants to the model picker.
+
+    Returns (new_data, patched_count, already_patched_count).
+    """
+    if _DISCOVERY_1M_ANCHOR not in data:
+        return data, 0, 0
+
+    edits = []
+    already = 0
+
+    for m in _DISCOVERY_1M_RE.finditer(data):
+        span_start, span_end = m.span()
+        var_name = m.group(1)
+        repl = var_name + b"=(e,t)=>!0"
+        pad = (span_end - span_start) - len(repl)
+        if pad < 0:
+            continue
+        repl += b" " * pad
+        edits.append((span_start, span_end, repl))
+
+    if not edits:
+        check_pos = 0
+        while True:
+            idx = data.find(_DISCOVERY_1M_ANCHOR, check_pos)
+            if idx < 0:
+                break
+            check_pos = idx + 1
+            window = data[max(0, idx - 400):idx]
+            if re.search(rb"=\s*(?:\([a-zA-Z0-9_$,\s]*\)|[a-zA-Z0-9_$]+)\s*=>\s*!0", window):
+                already += 1
+        return data, 0, already
+
+    out = data
+    for start, end, repl in sorted(edits, key=lambda e: e[0], reverse=True):
+        assert len(repl) == end - start
+        out = out[:start] + repl + out[end:]
+    return out, len(edits), already
+
 
 def patch_vm_start_gate(data: bytes):
     """
@@ -892,7 +945,7 @@ def show_status(asar_path: Path, backup_dir: Path) -> int:
     print(f"  version:  {version or '?'}")
 
     # 1. Payload patches
-    ban_total = ban_already = gate_left = 0
+    ban_total = ban_already = gate_left = disc_1m_total = disc_1m_already = 0
     for _, entry in _asar_iter_files(hdr):
         if "integrity" not in entry:
             continue
@@ -904,8 +957,12 @@ def show_status(asar_path: Path, backup_dir: Path) -> int:
         if _VM_GATE_ANCHOR in chunk:
             _, ngate = patch_vm_start_gate(chunk)
             gate_left += ngate
+        if _DISCOVERY_1M_ANCHOR in chunk:
+            _, n1m, already1m = patch_discovery_1m_models(chunk)
+            disc_1m_total += n1m
+            disc_1m_already += already1m
 
-    print(f"{Colors.BOLD}Model-name validators{Colors.RESET}")
+    print(f"{Colors.BOLD}Model-name validators & discovery{Colors.RESET}")
     if BANLIST_ANCHOR not in data and ban_already == 0:
         state = "unknown (anchor absent — different app build?)"
     elif ban_total == 0:
@@ -914,6 +971,14 @@ def show_status(asar_path: Path, backup_dir: Path) -> int:
         state = f"NOT patched ({ban_total} validator(s) active)"
     print(f"  banword check: {state}")
     print(f"  VM start gate: {'patched ✓' if gate_left == 0 else f'NOT patched ({gate_left} active)'}")
+
+    if _DISCOVERY_1M_ANCHOR not in data and disc_1m_already == 0:
+        disc_state = "unknown (anchor absent)"
+    elif disc_1m_total == 0:
+        disc_state = "patched ✓"
+    else:
+        disc_state = f"NOT patched ({disc_1m_total} pending)"
+    print(f"  discovery [1m]: {disc_state}")
 
     ion_dir = find_ion_dist_dir(asar_path)
     if ion_dir:
@@ -1083,6 +1148,7 @@ def patch_app_model_names(asar_path: Path, backup_dir: Path, resign: bool = True
     total_patched = 0
     total_already = 0
     vm_gates_patched = 0
+    disc_1m_patched = 0
     files_patched = []
     header_subs = []  # (offset_key, old_hash, new_hash, old_blocks, new_blocks)
 
@@ -1099,7 +1165,7 @@ def patch_app_model_names(asar_path: Path, backup_dir: Path, resign: bool = True
         off = base + int(entry["offset"])
         size = int(entry["size"])
         chunk = bytes(data[off:off + size])
-        if BANLIST_ANCHOR not in chunk and _VM_GATE_ANCHOR not in chunk:
+        if BANLIST_ANCHOR not in chunk and _VM_GATE_ANCHOR not in chunk and _DISCOVERY_1M_ANCHOR not in chunk:
             continue
 
         new_chunk, n, already = patch_banword_validators(chunk)
@@ -1108,7 +1174,11 @@ def patch_app_model_names(asar_path: Path, backup_dir: Path, resign: bool = True
         new_chunk, nvm = patch_vm_start_gate(new_chunk)
         vm_gates_patched += nvm
 
-        if n == 0 and nvm == 0:
+        new_chunk, n1m, already1m = patch_discovery_1m_models(new_chunk)
+        disc_1m_patched += n1m
+        total_already += already1m
+
+        if n == 0 and nvm == 0 and n1m == 0:
             continue
         assert len(new_chunk) == size
         data[off:off + size] = new_chunk
@@ -1119,11 +1189,11 @@ def patch_app_model_names(asar_path: Path, backup_dir: Path, resign: bool = True
         new_hash, new_blocks = _asar_integrity(new_chunk, bs)
         header_subs.append((entry["offset"], integ["hash"], new_hash,
                             list(integ["blocks"]), new_blocks))
-        total_patched += n
+        total_patched += n + n1m
 
     if not header_subs:
         if total_already:
-            success(f"Already patched ({total_already} validator(s), {vm_gates_patched} VM gate(s)).")
+            success(f"Already patched ({total_already} validator/feature(s), {vm_gates_patched} VM gate(s)).")
             # Still bring the bundle to a fully working state: plist hash sync,
             # probe cache seed, renderer patch and an entitlement-bearing re-sign.
             header_sha_now = hashlib.sha256(bytes(data[json_start:json_end])).hexdigest()
@@ -1190,8 +1260,12 @@ def patch_app_model_names(asar_path: Path, backup_dir: Path, resign: bool = True
             error("Try running with sudo (and keep ownership of the file).")
         return False
 
-    success(f"Patched {total_patched} model-name validator(s) and {vm_gates_patched} VM start gate(s) "
-            f"in {len(files_patched)} file(s):")
+    msg_parts = [f"{total_patched} model-name validator/discovery rule(s)"]
+    if vm_gates_patched:
+        msg_parts.append(f"{vm_gates_patched} VM start gate(s)")
+    if disc_1m_patched:
+        msg_parts.append(f"{disc_1m_patched} discovery 1M-context patch(es)")
+    success(f"Patched {', '.join(msg_parts)} in {len(files_patched)} file(s):")
     for p in files_patched:
         print(f"      {p}")
     success("ASAR header integrity hashes updated.")
