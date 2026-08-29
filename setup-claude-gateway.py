@@ -42,6 +42,10 @@ Optional app-bundle patch:
 
       - enables 1M-context [1m] variants for all discovered gateway models
         in the model picker,
+      - merges duplicate gateway models with effort suffixes (-low, -medium,
+        -high, ...) into single base model entries in the picker,
+      - enables thinking switchers dynamically matching each model's supported
+        effort levels from discovery,
       - recomputes per-file SHA256 integrity entries in the asar header
         (Electron verifies them on load),
       - updates the header hash recorded in Info.plist
@@ -729,6 +733,136 @@ def _asar_integrity(content: bytes, block_size: int):
 
 
 _VM_GATE_ANCHOR = b"?.isVirtualizationSupported?.();if("
+_COMPILE_CACHE_ANCHOR = b"compile-cache"
+
+_THINKING_ANCHOR = b"effort_options:"
+_DISC_DEDUP_ANCHOR = b"Gateway /v1/models returned 0 usable models"
+
+_DISC_DEDUP_RE = re.compile(
+    rb"let\s+([a-zA-Z0-9_$]+)=([a-zA-Z0-9_$]+)=>\{if\(typeof\s+\2!=[`\"\x27]string[`\"\x27]\)return;let\s+([a-zA-Z0-9_$]+)=\2\.toLowerCase\(\);return\s+([a-zA-Z0-9_$]+)\.includes\(\3\)\?\3:void 0\},"
+    rb"([a-zA-Z0-9_$]+)=\([a-zA-Z0-9_$,\s]*\)=>(?:!0|[^,]+),"
+    rb"([a-zA-Z0-9_$]+)=([a-zA-Z0-9_$]+)\.data\.filter\(\(([a-zA-Z0-9_$]+)=>!!\8\?\.id\)\)\.filter\(\(([a-zA-Z0-9_$]+)=>[a-zA-Z0-9_$]+\(\9\.id\)\|\|!!\1\(\9\.anthropic_family_tier\)\)\)\.map\(\(([a-zA-Z0-9_$]+)=>\{"
+    rb"let\s+[a-zA-Z0-9_$]+=\1\(\10\.anthropic_family_tier\);"
+    rb"return\{id:\10\.id,name:\10\.display_name\|\|\10\.id,"
+    rb"\.\.\.[a-zA-Z0-9_$]+&&\{anthropicFamilyTier:[a-zA-Z0-9_$]+\},"
+    rb"\.\.\.[a-zA-Z0-9_$]+&&\10\.is_family_default===!0&&\{isFamilyDefault:!0\},"
+    rb"\.\.\.\5\(\10\.supports_1m,\10\.max_input_tokens\)&&\{supports1m:!0\}\}\}\)"
+)
+
+_LPT_BLOCK_RE = re.compile(
+    rb"var\s+([a-zA-Z0-9_$]+)=\{effortLevels:\[`low`,`medium`,`high`,`xhigh`,`max`\],recommended:`high`,modes:\[`auto`\],disallowThinkingDisabled:!0\},"
+    rb"([a-zA-Z0-9_$]+)=\{.*?\bclaude-opus-5\b.*?\bdisallowThinkingDisabled:!0\}\},"
+    rb"([a-zA-Z0-9_$]+)=\/\^\(\?:claude-\)\?\(\?:fable\|mythos\)\(\?:-\|\$\)\/"
+)
+
+_THINKING_RESOLVER_RE = re.compile(
+    rb"function\s+([a-zA-Z0-9_$]+)\s*\(([a-zA-Z0-9_$]+)\)\s*\{"
+    rb"let\s+([a-zA-Z0-9_$]+)=([a-zA-Z0-9_$]+)\(\2\),"
+    rb"([a-zA-Z0-9_$]+)=([a-zA-Z0-9_$]+)\[\3\]\?\?"
+    rb"(?:(?:\([a-zA-Z0-9_$]+\.test\(\3\)\?[a-zA-Z0-9_$]+:void 0\))|\6\[\3\.split\([`\"\x27]\/[`\"\x27]\)\.pop\(\)\]\?\?([a-zA-Z0-9_$]+));"
+    rb"(?:if\(!\5\)return;)?"
+    rb"let\s+([a-zA-Z0-9_$]+)=([a-zA-Z0-9_$]+)\(\5\),"
+    rb"([a-zA-Z0-9_$]+)=([a-zA-Z0-9_$]+)\(\5\);"
+    rb"(?:if\(!\(!\8&&!\10\)\))?"
+    rb"(?:if\(\8\|\|\10\))?"
+    rb"return\{\.\.\.\8\?\{effort_options:\8,description:([a-zA-Z0-9_$]+)\}:\{\},\.\.\.\10\?\{mode_options:\10\}:\{\}\}\s*\}"
+)
+
+_THINKING_RESOLVER_UPGRADE_RE = re.compile(
+    rb"function\s+([a-zA-Z0-9_$]+)\s*\(([a-zA-Z0-9_$]+)\)\s*\{"
+    rb"let\s+([a-zA-Z0-9_$]+)=([a-zA-Z0-9_$]+)\(([a-zA-Z0-9_$]+)\(\2\)\)[;,]"
+    rb"(?:if\(!\3\)return;)?"
+    rb"(?:let\s+)?([a-zA-Z0-9_$]+)=([a-zA-Z0-9_$]+)\(\3\),"
+    rb"([a-zA-Z0-9_$]+)=([a-zA-Z0-9_$]+)\(\3\);"
+    rb"(?:if\(\6\|\|\8\))?"
+    rb"return\{\.\.\.\6\?\{effort_options:\6,description:([a-zA-Z0-9_$]+)\}:\{\},\.\.\.\8\?\{mode_options:\8\}:\{\}\}\s*\}"
+)
+
+
+def patch_thinking_models(data: bytes):
+    """
+    1. Rewrites model discovery so duplicate models with effort suffixes (-low, -medium,
+       -high, -extra-low, -xhigh, -max, -thinking) are merged into a single clean base model.
+    2. Populates thinking configuration per model so each model's thinking switcher
+       displays only the effort levels actually available on the server.
+
+    Returns (new_data, patched_count, already_patched_count).
+    """
+    if _THINKING_ANCHOR not in data and _DISC_DEDUP_ANCHOR not in data:
+        return data, 0, 0
+
+    edits = []
+    already = 0
+
+    # 1. Discovery deduplication & dynamic effort aggregation
+    m_disc = _DISC_DEDUP_RE.search(data)
+    if m_disc:
+        span_start, span_end = m_disc.span()
+        orig_len = span_end - span_start
+        var_u = m_disc.group(6)
+        var_s = m_disc.group(7)
+        repl = (
+            b"let R=/[- ]*(extra-low|low|medium|high|xhigh|max|thinking)$/i,M=new Map,"
+            + var_u + b"=(" + var_s + b".data.map(e=>{"
+            b"if(!e?.id)return;let m=e.id.match(R),b=m?e.id.slice(0,m.index):e.id,f=m?.[1]?.toLowerCase(),t=M.get(b);"
+            b"f=f==`extra-low`?`low`:f==`thinking`?`high`:f;"
+            b"t||(M.set(b,t={id:e.id,name:(e.display_name||b).replace(R,``),supports1m:!0,effortLevels:[],hasL:!1}),M.set(e.id,t));"
+            b"f?(t.effortLevels.push(f),t.hasL=!0):0}),globalThis._mEff=M,[...new Set(M.values())]"
+        )
+        pad = orig_len - len(repl)
+        if pad >= 0:
+            edits.append((span_start, span_end, repl + b" " * pad))
+    elif b"_mEff" in data:
+        already += 1
+
+    # 2. Config & resolver helper
+    var_dpt = None
+    m_lpt = _LPT_BLOCK_RE.search(data)
+    if m_lpt:
+        s_start, s_end = m_lpt.span()
+        orig_len = s_end - s_start
+        var_lpt, var_upt, var_dpt = m_lpt.groups()
+        repl_lpt = (
+            b"var " + var_lpt + b"={effortLevels:[`low`,`medium`,`high`,`xhigh`,`max`],recommended:`high`,modes:[`auto`]},"
+            + var_upt + b"={\"claude-haiku-4-5\":{modes:[`extended`]},\"claude-sonnet-4-5\":{modes:[`extended`]},\"claude-sonnet-4-6\":{effortLevels:[`low`,`medium`,`high`,`max`],recommended:`low`,modes:[`auto`]},\"claude-sonnet-5\":{effortLevels:[`low`,`medium`,`high`,`xhigh`,`max`],recommended:`medium`,modes:[`auto`]},\"claude-opus-4-6\":{effortLevels:[`low`,`medium`,`high`,`max`],recommended:`medium`,modes:[`extended`]},\"claude-opus-4-7\":{effortLevels:[`low`,`medium`,`high`,`xhigh`,`max`],recommended:`xhigh`,modes:[`auto`]}},"
+            + var_dpt + b"=e=>{let k=e.split(`/`).pop(),d=globalThis._mEff?.get(e)||globalThis._mEff?.get(k);"
+            b"return d&&!d.hasL?null:d?.effortLevels?.length?{effortLevels:d.effortLevels,recommended:d.effortLevels[0],modes:[`auto`]}:d?null:" + var_upt + b"[k]||" + var_lpt + b"}"
+        )
+        pad = orig_len - len(repl_lpt)
+        if pad >= 0:
+            edits.append((s_start, s_end, repl_lpt + b" " * pad))
+
+    # 3. Model selector thinking resolution
+    m_th = _THINKING_RESOLVER_RE.search(data) or _THINKING_RESOLVER_UPGRADE_RE.search(data)
+    if m_th:
+        s_start, s_end = m_th.span()
+        orig_len = s_end - s_start
+        if len(m_th.groups()) == 10:
+            fn_name, arg_e, var_n, var_dpt_m, fn_dT, var_r, fn_vpt, var_i, fn_ypt, var_fpt = m_th.groups()
+            resolved_dpt = var_dpt or var_dpt_m or b"dpt"
+        else:
+            fn_name, arg_e, var_t, fn_dT, var_n, var_upt_b, var_lpt_b, var_r, fn_vpt, var_i, fn_ypt, var_fpt = m_th.groups()
+            resolved_dpt = var_dpt or b"dpt"
+        repl_th = (
+            b"function " + fn_name + b"(" + arg_e + b"){"
+            b"let " + var_n + b"=" + resolved_dpt + b"(" + fn_dT + b"(" + arg_e + b"));"
+            b"if(!" + var_n + b")return;"
+            b"let " + var_r + b"=" + fn_vpt + b"(" + var_n + b")," + var_i + b"=" + fn_ypt + b"(" + var_n + b");"
+            b"if(" + var_r + b"||" + var_i + b")return{..." + var_r + b"?{effort_options:" + var_r + b",description:" + var_fpt + b"}:{},..." + var_i + b"?{mode_options:" + var_i + b"}:{}}}"
+        )
+        pad = orig_len - len(repl_th)
+        if pad >= 0:
+            edits.append((s_start, s_end, repl_th[:-1] + b" " * pad + b"}"))
+
+    if not edits:
+        return data, 0, already
+
+    out = data
+    for start, end, repl in sorted(edits, key=lambda e: e[0], reverse=True):
+        assert len(repl) == end - start
+        out = out[:start] + repl + out[end:]
+    return out, len(edits), already
+
 
 _DISCOVERY_1M_ANCHOR = b"max_input_tokens)&&{supports1m:!0}"
 _DISCOVERY_1M_RE = re.compile(
@@ -748,6 +882,8 @@ def patch_discovery_1m_models(data: bytes):
     Returns (new_data, patched_count, already_patched_count).
     """
     if _DISCOVERY_1M_ANCHOR not in data:
+        if b"_mEff" in data:
+            return data, 0, 1
         return data, 0, 0
 
     edits = []
@@ -764,15 +900,56 @@ def patch_discovery_1m_models(data: bytes):
         edits.append((span_start, span_end, repl))
 
     if not edits:
-        check_pos = 0
-        while True:
-            idx = data.find(_DISCOVERY_1M_ANCHOR, check_pos)
-            if idx < 0:
-                break
-            check_pos = idx + 1
-            window = data[max(0, idx - 400):idx]
-            if re.search(rb"=\s*(?:\([a-zA-Z0-9_$,\s]*\)|[a-zA-Z0-9_$]+)\s*=>\s*!0", window):
-                already += 1
+        if b"_mEff" in data:
+            already += 1
+        else:
+            check_pos = 0
+            while True:
+                idx = data.find(_DISCOVERY_1M_ANCHOR, check_pos)
+                if idx < 0:
+                    break
+                check_pos = idx + 1
+                window = data[max(0, idx - 400):idx]
+                if re.search(rb"=\s*(?:\([a-zA-Z0-9_$,\s]*\)|[a-zA-Z0-9_$]+)\s*=>\s*!0", window):
+                    already += 1
+        return data, 0, already
+
+    out = data
+    for start, end, repl in sorted(edits, key=lambda e: e[0], reverse=True):
+        assert len(repl) == end - start
+        out = out[:start] + repl + out[end:]
+    return out, len(edits), already
+
+
+_COMPILE_CACHE_GATE_RE = re.compile(rb"if\(\(([a-zA-Z0-9_$]+)\|\|([a-zA-Z0-9_$]+)\.app\.isPackaged\)&&([a-zA-Z0-9_$]+)\(")
+
+
+def patch_compile_cache_gate(data: bytes):
+    """
+    Disable pre-compiled V8 bytecode cache (.jsc) loader in index.pre.js so
+    Electron loads and compiles the patched .js files directly.
+
+    Returns (new_data, patched_count, already_patched_count).
+    """
+    edits = []
+    already = 0
+
+    for m in _COMPILE_CACHE_GATE_RE.finditer(data):
+        span_start, _ = m.span()
+        orig_span = m.group(0)
+        p1 = orig_span.find(b"((")
+        p2 = orig_span.find(b")&&")
+        if p1 < 0 or p2 < 0:
+            continue
+        span1 = span_start + p1 + 2
+        span2 = span_start + p2
+        orig_len = span2 - span1
+        repl = b"false" + b" " * (orig_len - 5)
+        edits.append((span1, span2, repl))
+
+    if not edits:
+        if b"if((false" in data and b")&&OU(" in data:
+            already += 1
         return data, 0, already
 
     out = data
@@ -955,6 +1132,7 @@ def show_status(asar_path: Path, backup_dir: Path) -> int:
 
     # 1. Payload patches
     ban_total = ban_already = gate_left = disc_1m_total = disc_1m_already = 0
+    thinking_total = thinking_already = 0
     for _, entry in _asar_iter_files(hdr):
         if "integrity" not in entry:
             continue
@@ -970,6 +1148,13 @@ def show_status(asar_path: Path, backup_dir: Path) -> int:
             _, n1m, already1m = patch_discovery_1m_models(chunk)
             disc_1m_total += n1m
             disc_1m_already += already1m
+        if _THINKING_ANCHOR in chunk:
+            _, nth, already_th = patch_thinking_models(chunk)
+            thinking_total += nth
+            thinking_already += already_th
+        if _COMPILE_CACHE_ANCHOR in chunk:
+            _, _, already_cc = patch_compile_cache_gate(chunk)
+            thinking_already += already_cc
 
     print(f"{Colors.BOLD}Model-name validators & discovery{Colors.RESET}")
     if BANLIST_ANCHOR not in data and ban_already == 0:
@@ -982,12 +1167,20 @@ def show_status(asar_path: Path, backup_dir: Path) -> int:
     print(f"  VM start gate: {'patched ✓' if gate_left == 0 else f'NOT patched ({gate_left} active)'}")
 
     if _DISCOVERY_1M_ANCHOR not in data and disc_1m_already == 0:
-        disc_state = "unknown (anchor absent)"
+        disc_state = "patched ✓" if b"_mEff" in data else "unknown (anchor absent)"
     elif disc_1m_total == 0:
         disc_state = "patched ✓"
     else:
         disc_state = f"NOT patched ({disc_1m_total} pending)"
     print(f"  discovery [1m]: {disc_state}")
+
+    if _THINKING_ANCHOR not in data and thinking_already == 0:
+        thinking_state = "unknown (anchor absent)"
+    elif thinking_total == 0:
+        thinking_state = "patched ✓"
+    else:
+        thinking_state = f"NOT patched ({thinking_total} pending)"
+    print(f"  thinking:       {thinking_state}")
 
     ion_dir = find_ion_dist_dir(asar_path)
     if ion_dir:
@@ -1158,6 +1351,7 @@ def patch_app_model_names(asar_path: Path, backup_dir: Path, resign: bool = True
     total_already = 0
     vm_gates_patched = 0
     disc_1m_patched = 0
+    thinking_patched = 0
     files_patched = []
     header_subs = []  # (offset_key, old_hash, new_hash, old_blocks, new_blocks)
 
@@ -1174,7 +1368,7 @@ def patch_app_model_names(asar_path: Path, backup_dir: Path, resign: bool = True
         off = base + int(entry["offset"])
         size = int(entry["size"])
         chunk = bytes(data[off:off + size])
-        if BANLIST_ANCHOR not in chunk and _VM_GATE_ANCHOR not in chunk and _DISCOVERY_1M_ANCHOR not in chunk:
+        if BANLIST_ANCHOR not in chunk and _VM_GATE_ANCHOR not in chunk and _DISCOVERY_1M_ANCHOR not in chunk and _THINKING_ANCHOR not in chunk and _COMPILE_CACHE_ANCHOR not in chunk:
             continue
 
         new_chunk, n, already = patch_banword_validators(chunk)
@@ -1187,7 +1381,14 @@ def patch_app_model_names(asar_path: Path, backup_dir: Path, resign: bool = True
         disc_1m_patched += n1m
         total_already += already1m
 
-        if n == 0 and nvm == 0 and n1m == 0:
+        new_chunk, nth, already_th = patch_thinking_models(new_chunk)
+        thinking_patched += nth
+        total_already += already_th
+
+        new_chunk, ncc, already_cc = patch_compile_cache_gate(new_chunk)
+        total_already += already_cc
+
+        if n == 0 and nvm == 0 and n1m == 0 and nth == 0 and ncc == 0:
             continue
         assert len(new_chunk) == size
         data[off:off + size] = new_chunk
@@ -1198,7 +1399,7 @@ def patch_app_model_names(asar_path: Path, backup_dir: Path, resign: bool = True
         new_hash, new_blocks = _asar_integrity(new_chunk, bs)
         header_subs.append((entry["offset"], integ["hash"], new_hash,
                             list(integ["blocks"]), new_blocks))
-        total_patched += n + n1m
+        total_patched += n + n1m + nth
 
     if not header_subs:
         if total_already:
@@ -1274,6 +1475,8 @@ def patch_app_model_names(asar_path: Path, backup_dir: Path, resign: bool = True
         msg_parts.append(f"{vm_gates_patched} VM start gate(s)")
     if disc_1m_patched:
         msg_parts.append(f"{disc_1m_patched} discovery 1M-context patch(es)")
+    if thinking_patched:
+        msg_parts.append(f"{thinking_patched} thinking capability patch(es)")
     success(f"Patched {', '.join(msg_parts)} in {len(files_patched)} file(s):")
     for p in files_patched:
         print(f"      {p}")
