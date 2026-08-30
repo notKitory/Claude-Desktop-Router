@@ -46,6 +46,8 @@ Optional app-bundle patch:
         -high, ...) into single base model entries in the picker,
       - enables thinking switchers dynamically matching each model's supported
         effort levels from discovery,
+      - enables prompt caching with dynamic boundary partitioning for all
+        custom gateway models,
       - recomputes per-file SHA256 integrity entries in the asar header
         (Electron verifies them on load),
       - updates the header hash recorded in Info.plist
@@ -735,12 +737,30 @@ def _asar_integrity(content: bytes, block_size: int):
 _VM_GATE_ANCHOR = b"?.isVirtualizationSupported?.();if("
 _COMPILE_CACHE_ANCHOR = b"compile-cache"
 
+_PROMPT_CACHE_ANCHOR = b"{{promptCacheBoundary}}"
+_SHORTNAME_OVERRIDES_ANCHOR = b"shortnameIdentityOverrides"
+
+_CT_RE = re.compile(
+    rb"function\s+([a-zA-Z0-9_$]+)\(([a-zA-Z0-9_$]+),([a-zA-Z0-9_$]+)\)\{"
+    rb"if\(!\2\)return\{status:[`\x27\x22]off[`\x27\x22]\};"
+    rb"let\s+([a-zA-Z0-9_$]+)=\3\?\.replace\(/\x5C\[\[\^\x5C\]\]\*\x5C\]\$/,``\);"
+    rb"if\(!\4\|\|!\2\.models\|\|!Object\.hasOwn\(\2\.models,\4\)\)return\{status:[`\x27\x22]miss[`\x27\x22]\};"
+    rb"let\s+([a-zA-Z0-9_$]+)=\2\.models\[\4\];"
+)
+
+_SP_GATE_RE = re.compile(
+    rb"let\s+([a-zA-Z0-9_$]+)=([a-zA-Z0-9_$]+)&&([a-zA-Z0-9_$]+)\.Qh\(\)\.type!==[`\x27\x22]3p[`\x27\x22]\?([a-zA-Z0-9_$]+)\(([a-zA-Z0-9_$]+),([a-zA-Z0-9_$]+)\):\{status:[`\x27\x22]off[`\x27\x22]\}"
+)
+
+_SHORTNAME_OVERRIDES_RE = re.compile(
+    rb"shortnameIdentityOverrides\(\)\{let\s+([a-zA-Z0-9_$]+)=\{\},([a-zA-Z0-9_$]+)=new\s+Set;for\(let\s+([a-zA-Z0-9_$]+)\s+of\s+this\.lastDiscovered\?\?\[\]\)\{let\s+([a-zA-Z0-9_$]+)=\3\.anthropicFamilyTier\?\?([a-zA-Z0-9_$]+)\.find\(\(([a-zA-Z0-9_$]+)=>\6===\3\.id\.toLowerCase\(\)\)\);if\(!\4\|\|([a-zA-Z0-9_$]+)\(\3\.id\)\)continue;let\s+([a-zA-Z0-9_$]+)=([a-zA-Z0-9_$]+)\(\4\);\(!\(\8\s+in\s+\1\)\|\|\3\.isFamilyDefault&&!\2\.has\(\8\)\)&&\(\1\[\8\]=\3\.id,\3\.isFamilyDefault&&\2\.add\(\8\)\)\}return\s+\1\}"
+)
+
 _THINKING_ANCHOR = b"effort_options:"
 _DISC_DEDUP_ANCHOR = b"Gateway /v1/models returned 0 usable models"
 
 _DISC_BLOCK_RE = re.compile(
     rb"if\(!Array\.isArray\(([a-zA-Z0-9_$]+)\.data\)\)return\s+([a-zA-Z0-9_$]+)\.warn\([^;]+;\s*"
-    rb"(?:"
     rb"let\s+([a-zA-Z0-9_$]+)=([a-zA-Z0-9_$]+)=>\{if\(typeof\s+\4!=[`\"\x27]string[`\"\x27]\)return;let\s+([a-zA-Z0-9_$]+)=\4\.toLowerCase\(\);return\s+([a-zA-Z0-9_$]+)\.includes\(\5\)\?\5:void 0\},"
     rb"([a-zA-Z0-9_$]+)=\([a-zA-Z0-9_$,\s]*\)=>(?:!0|[^,]+),"
     rb"([a-zA-Z0-9_$]+)=\1\.data\.filter\(\(([a-zA-Z0-9_$]+)=>!!\9\?\.id\)\)\.filter\(\(([a-zA-Z0-9_$]+)=>[a-zA-Z0-9_$]+\(\10\.id\)\|\|!!\3\(\10\.anthropic_family_tier\)\)\)\.map\(\(([a-zA-Z0-9_$]+)=>\{"
@@ -749,9 +769,6 @@ _DISC_BLOCK_RE = re.compile(
     rb"\.\.\.[a-zA-Z0-9_$]+&&\{anthropicFamilyTier:[a-zA-Z0-9_$]+\},"
     rb"\.\.\.[a-zA-Z0-9_$]+&&\11\.is_family_default===!0&&\{isFamilyDefault:!0\},"
     rb"\.\.\.[a-zA-Z0-9_$]+\(\11\.supports_1m,\11\.max_input_tokens\)&&\{supports1m:!0\}\}\}\)"
-    rb"|"
-    rb"let R=\/\[- \]\*\(extra-low\|low\|medium\|high\|xhigh\|max\|thinking\)\$\/i,M=new Map,\s*([a-zA-Z0-9_$]+)=\(\1\.data\.map\(e=>\{.*?\bglobalThis\._mEff=M,\[\.\.\.new Set\(M\.values\(\)\)\]\s*\)"
-    rb")"
 )
 
 _LPT_BLOCK_RE = re.compile(
@@ -781,7 +798,7 @@ _LPT_TRANSFORM_RE = re.compile(
     rb"([a-zA-Z0-9_$]+)=\5\.labelOverride\?\?\6\?\.name\?\?\5\.name,"
     rb"([a-zA-Z0-9_$]+)=\{"
     rb"id:\5\.id,name:\8,"
-    rb"description:.*?"
+    rb"description:\6\?\.description\?\?[a-zA-Z0-9_$]+\(\5\.id\),"
     rb"thinking:([a-zA-Z0-9_$]+)\(\3,\5\.id,\2\),"
     rb".*?"
     rb"\.\.\.\5\.restricted&&([a-zA-Z0-9_$]+)\(\8\)\};"
@@ -945,6 +962,85 @@ def patch_compile_cache_gate(data: bytes):
     if not edits:
         if b"if((false" in data and b")&&OU(" in data:
             already += 1
+        return data, 0, already
+
+    out = data
+    for start, end, repl in sorted(edits, key=lambda e: e[0], reverse=True):
+        assert len(repl) == end - start
+        out = out[:start] + repl + out[end:]
+    return out, len(edits), already
+
+
+def patch_prompt_caching(data: bytes):
+    """
+    Enable prompt caching for all custom gateway models:
+    1. Removes 3P gate on coworkSyspromptMap resolution so system prompt variant
+       caching with {{promptCacheBoundary}} is active in 3P sessions.
+    2. Modifies variant resolution (ct function) to fall back to the available
+       model variant if a custom model ID is not explicitly listed in the map.
+    3. Updates shortnameIdentityOverrides in GatewayProvider so all discovered
+       gateway models are mapped to default tiers if unmapped, enabling tier-based
+       caching and default model selection.
+
+    Returns (new_data, patched_count, already_patched_count).
+    """
+    if _PROMPT_CACHE_ANCHOR not in data and _SHORTNAME_OVERRIDES_ANCHOR not in data:
+        return data, 0, 0
+
+    edits = []
+    already = 0
+
+    # 1. Patch CT function in coworkSyspromptMap resolver
+    m_ct = _CT_RE.search(data)
+    if m_ct:
+        idx = m_ct.start()
+        close_idx = _match_brace(data, data.find(b"{", idx))
+        span_ct = data[idx:close_idx + 1]
+        fn_ct, arg_e, arg_t, var_n, var_r = m_ct.groups()
+        repl_ct = (
+            b"function " + fn_ct + b"(" + arg_e + b"," + arg_t + b"){"
+            b"if(!" + arg_e + b")return{status:`off`};"
+            b"let " + var_n + b"=" + arg_t + b"?.replace(/\\[[^\\]]*\\]$/,``)," + var_r + b"=" + arg_e + b".models?.[" + var_n + b"]??Object.values(" + arg_e + b".models??{})[0];"
+            b"if(!" + var_r + b")return{status:`miss`};if(" + var_r + b"?.source===`dropped`)return{status:`dropped`,source:`dropped`};"
+            b"let i=ot(" + var_r + b"?.source)?" + var_r + b".source:void 0,a=typeof " + var_r + b"?.variant_key==`string`?" + var_r + b".variant_key:null;"
+            b"if(a===null)return{status:`hit`,key:null,variant:null,source:i};if(!st.test(a))return{status:`invalid_entry`,source:i};"
+            b"let o=a;if(Object.hasOwn(it,o))return{status:`hit`,key:o,variant:it[o],source:i};"
+            b"let s=" + arg_e + b".keys&&Object.hasOwn(" + arg_e + b".keys,o)?" + arg_e + b".keys[o]:null;"
+            b"return!s||!at(s.mode)||typeof s.text!=`string`||!s.text?{status:`invalid_entry`,source:i}:s.mode===`replace`&&!s.text.includes(`{{promptCacheBoundary}}`)?{status:`missing_boundary`,source:i}:{status:`hit`,key:o,variant:{mode:s.mode,text:s.text},source:i}}"
+        )
+        pad = len(span_ct) - len(repl_ct)
+        if pad >= 0:
+            edits.append((idx, close_idx + 1, repl_ct + b" " * pad))
+    elif b"models?.[" in data and b"Object.values(" in data:
+        already += 1
+
+    # 2. Patch SP Gate in coworkSyspromptMap resolver
+    m_gate = _SP_GATE_RE.search(data)
+    if m_gate:
+        span_start, span_end = m_gate.span()
+        var_X, var_At, obj_t, fn_ct_call, var_Pt, var_N = m_gate.groups()
+        repl_gate = b"let " + var_X + b"=" + var_At + b"?" + fn_ct_call + b"(" + var_Pt + b"," + var_N + b"):{status:`off`}"
+        pad = (span_end - span_start) - len(repl_gate)
+        if pad >= 0:
+            edits.append((span_start, span_end, repl_gate + b" " * pad))
+    elif b"let X=At?ct(Pt,N):{status:`off`}" in data:
+        already += 1
+
+    # 3. Patch shortnameIdentityOverrides in GatewayProvider
+    m_sn = _SHORTNAME_OVERRIDES_RE.search(data)
+    if m_sn:
+        span_start, span_end = m_sn.span()
+        var_e, var_t, var_n, var_r, var_Tgt, arg_e, fn_fT, var_i, fn_ht = m_sn.groups()
+        repl = (
+            b"shortnameIdentityOverrides(){let " + var_e + b"={}," + var_t + b"=new Set;for(let " + var_n + b" of this.lastDiscovered??[]){let " + var_r + b"=" + var_n + b".anthropicFamilyTier??(" + var_Tgt + b".find(e=>" + var_n + b".id.includes(e))||`sonnet`);if(" + fn_fT + b"(" + var_n + b".id))continue;let " + var_i + b"=" + fn_ht + b"(" + var_r + b");(!(" + var_i + b" in " + var_e + b")||" + var_n + b".isFamilyDefault&&!" + var_t + b".has(" + var_i + b"))&&(" + var_e + b"[" + var_i + b"]=" + var_n + b".id," + var_n + b".isFamilyDefault&&" + var_t + b".add(" + var_i + b"))}return " + var_e + b"}"
+        )
+        pad = (span_end - span_start) - len(repl)
+        if pad >= 0:
+            edits.append((span_start, span_end, repl + b" " * pad))
+    elif b".id.includes(e))||`sonnet`)" in data:
+        already += 1
+
+    if not edits:
         return data, 0, already
 
     out = data
@@ -1128,6 +1224,7 @@ def show_status(asar_path: Path, backup_dir: Path) -> int:
     # 1. Payload patches
     ban_total = ban_already = gate_left = 0
     thinking_total = thinking_already = 0
+    prompt_cache_total = prompt_cache_already = 0
     for _, entry in _asar_iter_files(hdr):
         if "integrity" not in entry:
             continue
@@ -1146,6 +1243,10 @@ def show_status(asar_path: Path, backup_dir: Path) -> int:
         if _COMPILE_CACHE_ANCHOR in chunk:
             _, _, already_cc = patch_compile_cache_gate(chunk)
             thinking_already += already_cc
+        if _PROMPT_CACHE_ANCHOR in chunk or _SHORTNAME_OVERRIDES_ANCHOR in chunk:
+            _, npc, already_pc = patch_prompt_caching(chunk)
+            prompt_cache_total += npc
+            prompt_cache_already += already_pc
 
     print(f"{Colors.BOLD}Model-name validators & discovery{Colors.RESET}")
     if BANLIST_ANCHOR not in data and ban_already == 0:
@@ -1164,6 +1265,14 @@ def show_status(asar_path: Path, backup_dir: Path) -> int:
     else:
         thinking_state = f"NOT patched ({thinking_total} pending)"
     print(f"  discovery & thinking: {thinking_state}")
+
+    if _PROMPT_CACHE_ANCHOR not in data and _SHORTNAME_OVERRIDES_ANCHOR not in data and prompt_cache_already == 0:
+        pc_state = "unknown (anchor absent)"
+    elif prompt_cache_total == 0:
+        pc_state = "patched ✓"
+    else:
+        pc_state = f"NOT patched ({prompt_cache_total} pending)"
+    print(f"  prompt caching:       {pc_state}")
 
     ion_dir = find_ion_dist_dir(asar_path)
     if ion_dir:
@@ -1335,6 +1444,7 @@ def patch_app_model_names(asar_path: Path, backup_dir: Path, resign: bool = True
     vm_gates_patched = 0
     disc_1m_patched = 0
     thinking_patched = 0
+    prompt_cache_patched = 0
     files_patched = []
     header_subs = []  # (offset_key, old_hash, new_hash, old_blocks, new_blocks)
 
@@ -1351,7 +1461,7 @@ def patch_app_model_names(asar_path: Path, backup_dir: Path, resign: bool = True
         off = base + int(entry["offset"])
         size = int(entry["size"])
         chunk = bytes(data[off:off + size])
-        if BANLIST_ANCHOR not in chunk and _VM_GATE_ANCHOR not in chunk and _THINKING_ANCHOR not in chunk and _DISC_DEDUP_ANCHOR not in chunk and _COMPILE_CACHE_ANCHOR not in chunk:
+        if BANLIST_ANCHOR not in chunk and _VM_GATE_ANCHOR not in chunk and _THINKING_ANCHOR not in chunk and _DISC_DEDUP_ANCHOR not in chunk and _COMPILE_CACHE_ANCHOR not in chunk and _PROMPT_CACHE_ANCHOR not in chunk and _SHORTNAME_OVERRIDES_ANCHOR not in chunk:
             continue
 
         new_chunk, n, already = patch_banword_validators(chunk)
@@ -1367,7 +1477,11 @@ def patch_app_model_names(asar_path: Path, backup_dir: Path, resign: bool = True
         new_chunk, ncc, already_cc = patch_compile_cache_gate(new_chunk)
         total_already += already_cc
 
-        if n == 0 and nvm == 0 and nth == 0 and ncc == 0:
+        new_chunk, npc, already_pc = patch_prompt_caching(new_chunk)
+        prompt_cache_patched += npc
+        total_already += already_pc
+
+        if n == 0 and nvm == 0 and nth == 0 and ncc == 0 and npc == 0:
             continue
         assert len(new_chunk) == size
         data[off:off + size] = new_chunk
@@ -1378,7 +1492,7 @@ def patch_app_model_names(asar_path: Path, backup_dir: Path, resign: bool = True
         new_hash, new_blocks = _asar_integrity(new_chunk, bs)
         header_subs.append((entry["offset"], integ["hash"], new_hash,
                             list(integ["blocks"]), new_blocks))
-        total_patched += n + nth
+        total_patched += n + nth + npc
 
     if not header_subs:
         if total_already:
@@ -1454,6 +1568,8 @@ def patch_app_model_names(asar_path: Path, backup_dir: Path, resign: bool = True
         msg_parts.append(f"{vm_gates_patched} VM start gate(s)")
     if thinking_patched:
         msg_parts.append(f"{thinking_patched} discovery & thinking capability patch(es)")
+    if prompt_cache_patched:
+        msg_parts.append(f"{prompt_cache_patched} prompt caching patch(es)")
     success(f"Patched {', '.join(msg_parts)} in {len(files_patched)} file(s):")
     for p in files_patched:
         print(f"      {p}")
