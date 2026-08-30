@@ -40,8 +40,8 @@ Optional app-bundle patch:
     `--patch-model-names` rewrites the validator inside app.asar so any model
     name is accepted. It also:
 
-      - enables 1M-context [1m] variants for all discovered gateway models
-        in the model picker,
+      - enables 1M-context [1m] variants dynamically for models reporting
+        1M+ tokens context (context_length, contextWindow, max_input_tokens),
       - merges duplicate gateway models with effort suffixes (-low, -medium,
         -high, ...) into single base model entries in the picker,
       - enables thinking switchers dynamically matching each model's supported
@@ -738,15 +738,20 @@ _COMPILE_CACHE_ANCHOR = b"compile-cache"
 _THINKING_ANCHOR = b"effort_options:"
 _DISC_DEDUP_ANCHOR = b"Gateway /v1/models returned 0 usable models"
 
-_DISC_DEDUP_RE = re.compile(
-    rb"let\s+([a-zA-Z0-9_$]+)=([a-zA-Z0-9_$]+)=>\{if\(typeof\s+\2!=[`\"\x27]string[`\"\x27]\)return;let\s+([a-zA-Z0-9_$]+)=\2\.toLowerCase\(\);return\s+([a-zA-Z0-9_$]+)\.includes\(\3\)\?\3:void 0\},"
+_DISC_BLOCK_RE = re.compile(
+    rb"if\(!Array\.isArray\(([a-zA-Z0-9_$]+)\.data\)\)return\s+([a-zA-Z0-9_$]+)\.warn\([^;]+;\s*"
+    rb"(?:"
+    rb"let\s+([a-zA-Z0-9_$]+)=([a-zA-Z0-9_$]+)=>\{if\(typeof\s+\4!=[`\"\x27]string[`\"\x27]\)return;let\s+([a-zA-Z0-9_$]+)=\4\.toLowerCase\(\);return\s+([a-zA-Z0-9_$]+)\.includes\(\5\)\?\5:void 0\},"
     rb"([a-zA-Z0-9_$]+)=\([a-zA-Z0-9_$,\s]*\)=>(?:!0|[^,]+),"
-    rb"([a-zA-Z0-9_$]+)=([a-zA-Z0-9_$]+)\.data\.filter\(\(([a-zA-Z0-9_$]+)=>!!\8\?\.id\)\)\.filter\(\(([a-zA-Z0-9_$]+)=>[a-zA-Z0-9_$]+\(\9\.id\)\|\|!!\1\(\9\.anthropic_family_tier\)\)\)\.map\(\(([a-zA-Z0-9_$]+)=>\{"
-    rb"let\s+[a-zA-Z0-9_$]+=\1\(\10\.anthropic_family_tier\);"
-    rb"return\{id:\10\.id,name:\10\.display_name\|\|\10\.id,"
+    rb"([a-zA-Z0-9_$]+)=\1\.data\.filter\(\(([a-zA-Z0-9_$]+)=>!!\9\?\.id\)\)\.filter\(\(([a-zA-Z0-9_$]+)=>[a-zA-Z0-9_$]+\(\10\.id\)\|\|!!\3\(\10\.anthropic_family_tier\)\)\)\.map\(\(([a-zA-Z0-9_$]+)=>\{"
+    rb"let\s+[a-zA-Z0-9_$]+=\3\(\11\.anthropic_family_tier\);"
+    rb"return\{id:\11\.id,name:\11\.display_name\|\|\11\.id,"
     rb"\.\.\.[a-zA-Z0-9_$]+&&\{anthropicFamilyTier:[a-zA-Z0-9_$]+\},"
-    rb"\.\.\.[a-zA-Z0-9_$]+&&\10\.is_family_default===!0&&\{isFamilyDefault:!0\},"
-    rb"\.\.\.\5\(\10\.supports_1m,\10\.max_input_tokens\)&&\{supports1m:!0\}\}\}\)"
+    rb"\.\.\.[a-zA-Z0-9_$]+&&\11\.is_family_default===!0&&\{isFamilyDefault:!0\},"
+    rb"\.\.\.[a-zA-Z0-9_$]+\(\11\.supports_1m,\11\.max_input_tokens\)&&\{supports1m:!0\}\}\}\)"
+    rb"|"
+    rb"let R=\/\[- \]\*\(extra-low\|low\|medium\|high\|xhigh\|max\|thinking\)\$\/i,M=new Map,\s*([a-zA-Z0-9_$]+)=\(\1\.data\.map\(e=>\{.*?\bglobalThis\._mEff=M,\[\.\.\.new Set\(M\.values\(\)\)\]\s*\)"
+    rb")"
 )
 
 _LPT_BLOCK_RE = re.compile(
@@ -768,14 +773,23 @@ _THINKING_RESOLVER_RE = re.compile(
     rb"return\{\.\.\.\8\?\{effort_options:\8,description:([a-zA-Z0-9_$]+)\}:\{\},\.\.\.\10\?\{mode_options:\10\}:\{\}\}\s*\}"
 )
 
-_THINKING_RESOLVER_UPGRADE_RE = re.compile(
-    rb"function\s+([a-zA-Z0-9_$]+)\s*\(([a-zA-Z0-9_$]+)\)\s*\{"
-    rb"let\s+([a-zA-Z0-9_$]+)=([a-zA-Z0-9_$]+)\(([a-zA-Z0-9_$]+)\(\2\)\)[;,]"
-    rb"(?:if\(!\3\)return;)?"
-    rb"(?:let\s+)?([a-zA-Z0-9_$]+)=([a-zA-Z0-9_$]+)\(\3\),"
-    rb"([a-zA-Z0-9_$]+)=([a-zA-Z0-9_$]+)\(\3\);"
-    rb"(?:if\(\6\|\|\8\))?"
-    rb"return\{\.\.\.\6\?\{effort_options:\6,description:([a-zA-Z0-9_$]+)\}:\{\},\.\.\.\8\?\{mode_options:\8\}:\{\}\}\s*\}"
+_LPT_TRANSFORM_RE = re.compile(
+    rb"function\s+([a-zA-Z0-9_$]+)\(([a-zA-Z0-9_$]+),([a-zA-Z0-9_$]+)\)\{"
+    rb"let\s+([a-zA-Z0-9_$]+)=\2\.hybridModelSelector\?\.\[\3\];"
+    rb"return\s+\2\.models\.flatMap\(\(([a-zA-Z0-9_$]+)=>\{"
+    rb"let\s+([a-zA-Z0-9_$]+)=\4\?\.\[([a-zA-Z0-9_$]+)\(\5\.id\)\],"
+    rb"([a-zA-Z0-9_$]+)=\5\.labelOverride\?\?\6\?\.name\?\?\5\.name,"
+    rb"([a-zA-Z0-9_$]+)=\{"
+    rb"id:\5\.id,name:\8,"
+    rb"description:.*?"
+    rb"thinking:([a-zA-Z0-9_$]+)\(\3,\5\.id,\2\),"
+    rb".*?"
+    rb"\.\.\.\5\.restricted&&([a-zA-Z0-9_$]+)\(\8\)\};"
+    rb"return!\5\.supports1m\|\|\5\.restricted\?\[\9\]:.*?\}\)\)\}"
+)
+
+_T_TRANSFORM_RE = re.compile(
+    rb"function\s+([a-zA-Z0-9_$]+)\(([a-zA-Z0-9_$]+)\)\{return\s+\2\.flatMap\(\(([a-zA-Z0-9_$]+)=>\3\.supports1m&&!\3\.restricted\?\[\3\.id,`\$\{\3\.id\}\[1m\]`\]:\[\3\.id\]\)\)\}"
 )
 
 
@@ -794,25 +808,29 @@ def patch_thinking_models(data: bytes):
     edits = []
     already = 0
 
-    # 1. Discovery deduplication & dynamic effort aggregation
-    m_disc = _DISC_DEDUP_RE.search(data)
+    # 1. Discovery deduplication & dynamic effort and context aggregation
+    m_disc = _DISC_BLOCK_RE.search(data)
     if m_disc:
         span_start, span_end = m_disc.span()
         orig_len = span_end - span_start
-        var_u = m_disc.group(6)
-        var_s = m_disc.group(7)
+        var_s = m_disc.group(1)
+        var_D = m_disc.group(2)
+        var_u = m_disc.group(8) or m_disc.group(12)
         repl = (
+            b"if(!Array.isArray(" + var_s + b".data))return " + var_D + b".warn(`[custom-3p] bad`),{ok:!1,kind:`error`,message:`Bad`,httpStatus:e.status,requestUrl:o};"
             b"let R=/[- ]*(extra-low|low|medium|high|xhigh|max|thinking)$/i,M=new Map,"
             + var_u + b"=(" + var_s + b".data.map(e=>{"
-            b"if(!e?.id)return;let m=e.id.match(R),b=m?e.id.slice(0,m.index):e.id,f=m?.[1]?.toLowerCase(),t=M.get(b);"
+            b"if(!e?.id)return;let m=e.id.match(R),b=m?e.id.slice(0,m.index):e.id,f=m?.[1]?.toLowerCase(),t=M.get(b),"
+            b"c=e.context_length||e.capabilities?.contextWindow||e.max_input_tokens||e.context_window,w=e.supports_1m===!0||c>=1e6;"
             b"f=f==`extra-low`?`low`:f==`thinking`?`high`:f;"
-            b"t||(M.set(b,t={id:e.id,name:(e.display_name||b).replace(R,``),supports1m:!0,effortLevels:[],hasL:!1}),M.set(e.id,t));"
+            b"t||(M.set(b,t={id:e.id,name:(e.display_name||b).replace(R,``),context:c,effortLevels:[],hasL:!1}),M.set(e.id,t));"
+            b"w&&(t.supports1m=!0);"
             b"f?(t.effortLevels.push(f),t.hasL=!0):0}),globalThis._mEff=M,[...new Set(M.values())]"
         )
         pad = orig_len - len(repl)
         if pad >= 0:
             edits.append((span_start, span_end, repl + b" " * pad))
-    elif b"_mEff" in data:
+    elif b"_mEff" in data and b"context_length" in data:
         already += 1
 
     # 2. Config & resolver helper
@@ -833,7 +851,7 @@ def patch_thinking_models(data: bytes):
             edits.append((s_start, s_end, repl_lpt + b" " * pad))
 
     # 3. Model selector thinking resolution
-    m_th = _THINKING_RESOLVER_RE.search(data) or _THINKING_RESOLVER_UPGRADE_RE.search(data)
+    m_th = _THINKING_RESOLVER_RE.search(data)
     if m_th:
         s_start, s_end = m_th.span()
         orig_len = s_end - s_start
@@ -853,65 +871,42 @@ def patch_thinking_models(data: bytes):
         pad = orig_len - len(repl_th)
         if pad >= 0:
             edits.append((s_start, s_end, repl_th[:-1] + b" " * pad + b"}"))
+    elif b"dpt(" in data:
+        already += 1
+
+    # 4. Model selector context description & 1M-only variant (hide non-1m variant when supports1m: true)
+    m_lpt_tr = _LPT_TRANSFORM_RE.search(data)
+    if m_lpt_tr:
+        s_start, s_end = m_lpt_tr.span()
+        orig_len = s_end - s_start
+        fn_name, arg_e, arg_t, var_n, var_r, var_i, fn_dT, var_a, var_o, fn_vT, fn_rpt = m_lpt_tr.groups()
+        repl_lpt_tr = (
+            b"function " + fn_name + b"(" + arg_e + b"," + arg_t + b"){"
+            b"let " + var_n + b"=" + arg_e + b".hybridModelSelector?.[" + arg_t + b"];"
+            b"return " + arg_e + b".models.flatMap((" + var_r + b"=>{"
+            b"let " + var_i + b"=" + var_n + b"?." + b"[" + fn_dT + b"(" + var_r + b".id)],"
+            + var_a + b"=" + var_r + b".labelOverride??" + var_i + b"?.name??" + var_r + b".name,"
+            + var_o + b"={id:" + var_r + b".id,name:" + var_a + b","
+            b"description:" + var_r + b".context?`${Math.round(" + var_r + b".context/1e3)}k context`:" + var_i + b"?.description??Ppt(" + var_r + b".id),"
+            b"thinking:" + fn_vT + b"(" + arg_t + b"," + var_r + b".id," + arg_e + b"),..." + var_i + b",..." + var_r + b".restricted&&" + fn_rpt + b"(" + var_a + b")};"
+            b"return!" + var_r + b".supports1m||" + var_r + b".restricted?[" + var_o + b"]:[{..." + var_o + b",id:`${" + var_r + b".id}[1m]`,description:Fpt,supports_1m_context:!0}]}))}"
+        )
+        pad = orig_len - len(repl_lpt_tr)
+        if pad >= 0:
+            edits.append((s_start, s_end, repl_lpt_tr[:-1] + b" " * pad + b"}"))
+
+    # 5. Direct mapping for 1M models in model resolution
+    m_t_tr = _T_TRANSFORM_RE.search(data)
+    if m_t_tr:
+        s_start, s_end = m_t_tr.span()
+        orig_len = s_end - s_start
+        fn_t, arg_e, arg_e2 = m_t_tr.groups()
+        repl_t_tr = b"function " + fn_t + b"(" + arg_e + b"){return " + arg_e + b".flatMap((" + arg_e2 + b"=>" + arg_e2 + b".supports1m&&!" + arg_e2 + b".restricted?[`${" + arg_e2 + b".id}[1m]`]:[" + arg_e2 + b".id]))}"
+        pad = orig_len - len(repl_t_tr)
+        if pad >= 0:
+            edits.append((s_start, s_end, repl_t_tr + b" " * pad))
 
     if not edits:
-        return data, 0, already
-
-    out = data
-    for start, end, repl in sorted(edits, key=lambda e: e[0], reverse=True):
-        assert len(repl) == end - start
-        out = out[:start] + repl + out[end:]
-    return out, len(edits), already
-
-
-_DISCOVERY_1M_ANCHOR = b"max_input_tokens)&&{supports1m:!0}"
-_DISCOVERY_1M_RE = re.compile(
-    rb"([a-zA-Z0-9_$]+)=\(([a-zA-Z0-9_$]+),([a-zA-Z0-9_$]+)\)=>"
-    rb"typeof\s+\2==[`\"\x27]boolean[`\"\x27]\?\2:"
-    rb"typeof\s+\3==[`\"\x27]number[`\"\x27]&&\3>=1e6"
-)
-
-
-def patch_discovery_1m_models(data: bytes):
-    """
-    Rewrite the model discovery 1M-context capability probe:
-      `l=(e,t)=>typeof e==`boolean`?e:typeof t==`number`&&t>=1e6` -> `l=(e,t)=>!0`
-    so that all discovered gateway models are granted supports1m=true, adding their
-    [1m] extended context variants to the model picker.
-
-    Returns (new_data, patched_count, already_patched_count).
-    """
-    if _DISCOVERY_1M_ANCHOR not in data:
-        if b"_mEff" in data:
-            return data, 0, 1
-        return data, 0, 0
-
-    edits = []
-    already = 0
-
-    for m in _DISCOVERY_1M_RE.finditer(data):
-        span_start, span_end = m.span()
-        var_name = m.group(1)
-        repl = var_name + b"=(e,t)=>!0"
-        pad = (span_end - span_start) - len(repl)
-        if pad < 0:
-            continue
-        repl += b" " * pad
-        edits.append((span_start, span_end, repl))
-
-    if not edits:
-        if b"_mEff" in data:
-            already += 1
-        else:
-            check_pos = 0
-            while True:
-                idx = data.find(_DISCOVERY_1M_ANCHOR, check_pos)
-                if idx < 0:
-                    break
-                check_pos = idx + 1
-                window = data[max(0, idx - 400):idx]
-                if re.search(rb"=\s*(?:\([a-zA-Z0-9_$,\s]*\)|[a-zA-Z0-9_$]+)\s*=>\s*!0", window):
-                    already += 1
         return data, 0, already
 
     out = data
@@ -1131,7 +1126,7 @@ def show_status(asar_path: Path, backup_dir: Path) -> int:
     print(f"  version:  {version or '?'}")
 
     # 1. Payload patches
-    ban_total = ban_already = gate_left = disc_1m_total = disc_1m_already = 0
+    ban_total = ban_already = gate_left = 0
     thinking_total = thinking_already = 0
     for _, entry in _asar_iter_files(hdr):
         if "integrity" not in entry:
@@ -1144,11 +1139,7 @@ def show_status(asar_path: Path, backup_dir: Path) -> int:
         if _VM_GATE_ANCHOR in chunk:
             _, ngate = patch_vm_start_gate(chunk)
             gate_left += ngate
-        if _DISCOVERY_1M_ANCHOR in chunk:
-            _, n1m, already1m = patch_discovery_1m_models(chunk)
-            disc_1m_total += n1m
-            disc_1m_already += already1m
-        if _THINKING_ANCHOR in chunk:
+        if _THINKING_ANCHOR in chunk or _DISC_DEDUP_ANCHOR in chunk:
             _, nth, already_th = patch_thinking_models(chunk)
             thinking_total += nth
             thinking_already += already_th
@@ -1166,21 +1157,13 @@ def show_status(asar_path: Path, backup_dir: Path) -> int:
     print(f"  banword check: {state}")
     print(f"  VM start gate: {'patched ✓' if gate_left == 0 else f'NOT patched ({gate_left} active)'}")
 
-    if _DISCOVERY_1M_ANCHOR not in data and disc_1m_already == 0:
-        disc_state = "patched ✓" if b"_mEff" in data else "unknown (anchor absent)"
-    elif disc_1m_total == 0:
-        disc_state = "patched ✓"
-    else:
-        disc_state = f"NOT patched ({disc_1m_total} pending)"
-    print(f"  discovery [1m]: {disc_state}")
-
-    if _THINKING_ANCHOR not in data and thinking_already == 0:
+    if _THINKING_ANCHOR not in data and _DISC_DEDUP_ANCHOR not in data and thinking_already == 0:
         thinking_state = "unknown (anchor absent)"
     elif thinking_total == 0:
         thinking_state = "patched ✓"
     else:
         thinking_state = f"NOT patched ({thinking_total} pending)"
-    print(f"  thinking:       {thinking_state}")
+    print(f"  discovery & thinking: {thinking_state}")
 
     ion_dir = find_ion_dist_dir(asar_path)
     if ion_dir:
@@ -1368,7 +1351,7 @@ def patch_app_model_names(asar_path: Path, backup_dir: Path, resign: bool = True
         off = base + int(entry["offset"])
         size = int(entry["size"])
         chunk = bytes(data[off:off + size])
-        if BANLIST_ANCHOR not in chunk and _VM_GATE_ANCHOR not in chunk and _DISCOVERY_1M_ANCHOR not in chunk and _THINKING_ANCHOR not in chunk and _COMPILE_CACHE_ANCHOR not in chunk:
+        if BANLIST_ANCHOR not in chunk and _VM_GATE_ANCHOR not in chunk and _THINKING_ANCHOR not in chunk and _DISC_DEDUP_ANCHOR not in chunk and _COMPILE_CACHE_ANCHOR not in chunk:
             continue
 
         new_chunk, n, already = patch_banword_validators(chunk)
@@ -1377,10 +1360,6 @@ def patch_app_model_names(asar_path: Path, backup_dir: Path, resign: bool = True
         new_chunk, nvm = patch_vm_start_gate(new_chunk)
         vm_gates_patched += nvm
 
-        new_chunk, n1m, already1m = patch_discovery_1m_models(new_chunk)
-        disc_1m_patched += n1m
-        total_already += already1m
-
         new_chunk, nth, already_th = patch_thinking_models(new_chunk)
         thinking_patched += nth
         total_already += already_th
@@ -1388,7 +1367,7 @@ def patch_app_model_names(asar_path: Path, backup_dir: Path, resign: bool = True
         new_chunk, ncc, already_cc = patch_compile_cache_gate(new_chunk)
         total_already += already_cc
 
-        if n == 0 and nvm == 0 and n1m == 0 and nth == 0 and ncc == 0:
+        if n == 0 and nvm == 0 and nth == 0 and ncc == 0:
             continue
         assert len(new_chunk) == size
         data[off:off + size] = new_chunk
@@ -1399,7 +1378,7 @@ def patch_app_model_names(asar_path: Path, backup_dir: Path, resign: bool = True
         new_hash, new_blocks = _asar_integrity(new_chunk, bs)
         header_subs.append((entry["offset"], integ["hash"], new_hash,
                             list(integ["blocks"]), new_blocks))
-        total_patched += n + n1m + nth
+        total_patched += n + nth
 
     if not header_subs:
         if total_already:
@@ -1473,10 +1452,8 @@ def patch_app_model_names(asar_path: Path, backup_dir: Path, resign: bool = True
     msg_parts = [f"{total_patched} model-name validator/discovery rule(s)"]
     if vm_gates_patched:
         msg_parts.append(f"{vm_gates_patched} VM start gate(s)")
-    if disc_1m_patched:
-        msg_parts.append(f"{disc_1m_patched} discovery 1M-context patch(es)")
     if thinking_patched:
-        msg_parts.append(f"{thinking_patched} thinking capability patch(es)")
+        msg_parts.append(f"{thinking_patched} discovery & thinking capability patch(es)")
     success(f"Patched {', '.join(msg_parts)} in {len(files_patched)} file(s):")
     for p in files_patched:
         print(f"      {p}")

@@ -28,12 +28,11 @@ Any custom model name containing one of these words — or not looking like an A
 | # | Layer | Where | Fix |
 |---|-------|-------|-----|
 | 1 | Model-name validators (main process) | `app.asar` → `.vite/build/*.js` | Validator functions rewritten to `return!0` / probe to `return!1` |
-| 2 | Model discovery 1M-context variants | `app.asar` → `.vite/build/*.js` | Capability probe rewritten to `return!0` so all discovered gateway models offer `[1m]` extended context variants in the picker |
-| 3 | Thinking effort switches & model deduplication | `app.asar` → `.vite/build/*.js` | Merges duplicate models with effort suffixes into single base models and dynamically enables thinking switchers with server-supported effort levels |
-| 4 | Per-file ASAR integrity | asar header (`"integrity"` entries) | SHA256 hash + 4 MiB block hashes recomputed |
-| 5 | Header integrity | `Info.plist` → `ElectronAsarIntegrity` (macOS) | Header SHA256 updated |
-| 6 | Settings-UI validators (renderer) | `Resources/ion-dist/assets/v1/*.js` | Same validator rewrite (inverted form) |
-| 7 | Cowork VM start gate | `app.asar` | Refusal on non-`supported` probe result removed; `vm-support-probe.json` caches seeded with `virtSupport: supported` |
+| 2 | Model discovery, server context & thinking switches | `app.asar` → `.vite/build/*.js` | Merges duplicate models with effort suffixes into single base models, enables thinking switchers with server-supported effort levels, and dynamically sets 1M-context variants for models with server context >= 1M |
+| 3 | Per-file ASAR integrity | asar header (`"integrity"` entries) | SHA256 hash + 4 MiB block hashes recomputed |
+| 4 | Header integrity | `Info.plist` → `ElectronAsarIntegrity` (macOS) | Header SHA256 updated |
+| 5 | Settings-UI validators (renderer) | `Resources/ion-dist/assets/v1/*.js` | Same validator rewrite (inverted form) |
+| 6 | Cowork VM start gate | `app.asar` | Refusal on non-`supported` probe result removed; `vm-support-probe.json` caches seeded with `virtSupport: supported` |
 
 On macOS the script then re-signs the bundle ad-hoc **with embedded entitlements** (`com.apple.security.virtualization`, JIT, …) and hardened runtime enabled — otherwise macOS refuses to launch the modified app and Virtualization.framework refuses to create the workspace VM.
 
@@ -105,11 +104,10 @@ Shows every layer at a glance:
 
 ```
 Model-name validators & discovery
-  banword check:  patched ✓
-  VM start gate:  patched ✓
-  discovery [1m]: patched ✓
-  thinking:       patched ✓
-  settings UI:    patched ✓
+  banword check:        patched ✓
+  VM start gate:        patched ✓
+  discovery & thinking: patched ✓
+  settings UI:          patched ✓
 Integrity
   Info.plist header hash: in sync ✓
   signature:              0x10002(adhoc,runtime); virtualization entitlement: yes ✓
